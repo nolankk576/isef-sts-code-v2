@@ -29,31 +29,6 @@ CACHE_DIR = APP_DIR / "model_cache"
 os.environ["TORCH_HOME"] = str(CACHE_DIR / "torch")
 os.environ["HF_HOME"] = str(CACHE_DIR / "huggingface")
 
-# If you provide a prebuilt model cache zip URL via Streamlit secrets
-# (MODEL_CACHE_ZIP_URL) or an environment variable, the app will download
-# and extract it on first run so you don't need to commit large files to the
-# repository. This runs only when model_cache/ is missing and the URL is set.
-import zipfile
-import tempfile
-MODEL_ZIP_URL = st.secrets.get("MODEL_CACHE_ZIP_URL") if hasattr(st, "secrets") else None
-if not MODEL_ZIP_URL:
-    MODEL_ZIP_URL = os.environ.get("MODEL_CACHE_ZIP_URL")
-if not (CACHE_DIR / "huggingface").exists() and MODEL_ZIP_URL:
-    try:
-        with st.spinner("Downloading model cache (one-time)..."):
-            r = requests.get(MODEL_ZIP_URL, stream=True, timeout=300)
-            r.raise_for_status()
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        tmp.write(chunk)
-        with zipfile.ZipFile(tmp.name, "r") as z:
-            z.extractall(path=Path(__file__).parent)
-        os.unlink(tmp.name)
-        st.success("Model cache installed — continuing startup.")
-    except Exception as e:
-        st.warning(f"Model cache download failed: {e}")
-
 # Only force fully-offline mode if a real pre-populated cache already exists
 # (the Raspberry Pi / `python setup_models.py` workflow). On Streamlit
 # Community Cloud there's no way to ship a 436MB BioClinicalBERT cache inside
@@ -77,11 +52,11 @@ BUNDLE_PATH = APP_DIR / "dermscript_inference_bundle.pkl"
 # single ground-truth length the whole pixel->mm conversion depends on.
 RING_BUMP_SPACING_MM = 20.0   # << MEASURE YOUR PRINTED RING AND UPDATE THIS
 
-# ────────────────────────────────────────────────────────────────��[...]
+# ──────────────────────────────────────────────────────────────────────────
 # Theme — "calibration instrument" aesthetic: dark optics-bench backdrop,
 # monospace readouts for anything measured/scored, a thin amber tick-rule
 # motif borrowed from the physical Contact Ring this app pairs with.
-# ────────────────────────────────────────────────────────────────��[...]
+# ──────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="DermScript", page_icon="🔬", layout="wide")
 TEAL, CORAL, PUR, AMBER, BG, PANEL, LINE, INK, MUTED = (
     "#3fd6a8", "#ff6b81", "#a78bfa", "#e8a33d",
@@ -157,9 +132,9 @@ st.markdown(
 )
 
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 # Model loading — fully offline, cached once per process
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading DermScript model bundle…")
 def load_bundle():
     with open(BUNDLE_PATH, "rb") as f:
@@ -244,9 +219,9 @@ def embed(image, text, device, mnet, tok, bert, img_tf, tta=True):
     return np.hstack([v, n]), t_orig
 
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 # Real Grad-CAM on MobileNetV3's last conv block
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 def grad_cam(image_tensor, mnet, feat_extractor, pool, device):
     """Genuine Grad-CAM: hooks the last conv block's activations + gradients
     w.r.t. the pooled-feature norm (proxy target since this is a feature
@@ -293,9 +268,9 @@ def overlay_heatmap(pil_img, cam):
     return (blended * 255).clip(0, 255).astype(np.uint8)
 
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 # Real SHAP on the underlying LightGBM step (one of the calibrated folds)
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 def shap_breakdown(bundle, X, vis_dim, nlp_dim):
     """Pulls one fitted (scaler, pca, lgbm) pipeline out of the
     CalibratedClassifierCV wrapper and runs a real TreeExplainer on it.
@@ -332,9 +307,9 @@ def shap_breakdown(bundle, X, vis_dim, nlp_dim):
     return vision_contrib / total, text_contrib / total, sv, is_vision_dominant
 
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 # Ruler-bump homography: detect the 4 physical bumps, compute mm/px scale
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     """Detects 4 small bright circular bumps near the image border (the
     Contact Ring's ruler bumps) via Hough circle detection, uses their
@@ -392,9 +367,9 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     return diameter_mm, debug
 
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 # Header
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 st.markdown('<div class="ds-eyebrow">EDGE-DEPLOYED · FULLY OFFLINE · RESEARCH PROTOTYPE</div>', unsafe_allow_html=True)
 st.title("🔬 DermScript")
 st.markdown('<div class="ds-tickrule"></div>', unsafe_allow_html=True)
@@ -404,9 +379,9 @@ st.caption(
     "licensed clinician before any care decision."
 )
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 # Sidebar — patient context + device link, grouped for a quick scan
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="ds-eyebrow">Patient metadata</div>', unsafe_allow_html=True)
     age = st.number_input("Age", min_value=0, max_value=120, value=45)
@@ -446,35 +421,59 @@ with st.sidebar:
     capture_clicked = cap_col.button("📷 Capture", type="primary", use_container_width=True)
     st.caption("Manual upload below always works as a fallback, device or not.")
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 # System status row — model bundle / offline cache, surfaced up top so a
-# broken setup is obvious before anyone uploads an image
-# ────────────────────────────────────────────────────────────────�[...]
+# broken setup is obvious before anyone uploads an image.
+#
+# Both the bundle and the vision/language backbones are loaded EAGERLY here
+# (before the status row renders), not lazily on first "Run analysis" click.
+# That means: on a fresh Streamlit Community Cloud container, the one-time
+# ~436MB backbone download happens once, silently, behind Streamlit's own
+# loading spinner, while the page is still loading -- the user never sees a
+# "cache not found" warning. On the Pi/offline path the local cache is just
+# read straight off disk, so this adds no real delay there.
+# ──────────────────────────────────────────────────────────────────────────
 bundle_ok = BUNDLE_PATH.exists()
-cache_ok = (CACHE_DIR / "huggingface").exists()
-status_html = '<div class="ds-status-row">'
-status_html += f'<div class="ds-status {"ok" if bundle_ok else "bad"}">● MODEL BUNDLE {"LOADED" if bundle_ok else "MISSING"}</div>'
-status_html += f'<div class="ds-status {"ok" if cache_ok else "warn"}">● OFFLINE CACHE {"READY" if cache_ok else "NOT FOUND"}</div>'
-status_html += '<div class="ds-status">● MODE: AIR-GAPPED INFERENCE</div>'
-status_html += '</div>'
-st.markdown(status_html, unsafe_allow_html=True)
-
 if not bundle_ok:
     st.error(f"Model bundle not found at `{BUNDLE_PATH}`. Copy `dermscript_inference_bundle.pkl` next to `app.py`.")
     st.stop()
-if not cache_ok:
-    st.warning(
-        "`model_cache/` not found — run `python setup_models.py` once with "
-        "internet access, then copy `model_cache/` onto this device."
-    )
 
 bundle = load_bundle()
 vis_dim = bundle.get("vis_dim", 960)
 nlp_dim = bundle.get("nlp_dim", 768)
 
-# ────────────────────────────────────────────────────────────────�[...]
+try:
+    device, mnet, feat_extractor, pool, tok, bert, img_tf = load_backbones()
+    backbones_ok = True
+except Exception as e:
+    backbones_ok = False
+    backbone_error = str(e)
+
+# Cache is "ready" if the backbones actually loaded, regardless of whether
+# that came from a pre-populated local folder (Pi) or a download that just
+# happened (Cloud first run) -- both leave model_cache/ populated on disk.
+cache_ok = backbones_ok and (CACHE_DIR / "huggingface").exists()
+
+status_html = '<div class="ds-status-row">'
+status_html += f'<div class="ds-status {"ok" if bundle_ok else "bad"}">● MODEL BUNDLE LOADED</div>'
+status_html += f'<div class="ds-status {"ok" if cache_ok else "bad"}">● OFFLINE CACHE {"READY" if cache_ok else "FAILED"}</div>'
+status_html += '<div class="ds-status">● MODE: AIR-GAPPED INFERENCE</div>'
+status_html += '</div>'
+st.markdown(status_html, unsafe_allow_html=True)
+
+if not backbones_ok:
+    st.error(
+        "Could not load the vision/language backbones. On Streamlit Cloud this "
+        "usually means the one-time download was interrupted (slow connection / "
+        "cold start) -- just reload the page and let it finish. On the Pi/offline "
+        "path it means `model_cache/` wasn't copied next to `app.py`.\n\n"
+        f"Details: {backbone_error}"
+    )
+    st.stop()
+
+# ──────────────────────────────────────────────────────────────────────────
 # Image intake
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 st.divider()
 intake_col, preview_col = st.columns([2, 1], gap="large")
 
@@ -513,15 +512,17 @@ with preview_col:
             unsafe_allow_html=True,
         )
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 # Analysis
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 if source_bytes is not None and run:
     raw_bytes = source_bytes
     pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-    device, mnet, feat_extractor, pool, tok, bert, img_tf = load_backbones()
+    # device, mnet, feat_extractor, pool, tok, bert, img_tf already loaded
+    # eagerly above (status row) -- no need to call load_backbones() again,
+    # @st.cache_resource would just return the same cached objects anyway.
 
     full_note = f"Age {age}, {sex}, site: {site}. {note}".strip()
 
@@ -632,9 +633,9 @@ if source_bytes is not None and run:
 elif source_bytes is not None:
     st.caption("Image ready — click **Run DermScript analysis** above to score it.")
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 # Footer — external validation status, always visible
-# ────────────────────────────────────────────────────────────────�[...]
+# ──────────────────────────────────────────────────────────────────────────
 st.markdown(
     f"""<div class="ds-footer">
     EXTERNAL VALIDATION — Stanford DDI external AUC=0.585 (distribution shift,
