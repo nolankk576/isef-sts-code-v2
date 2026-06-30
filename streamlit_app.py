@@ -1,10 +1,12 @@
 """
-DermScript — Clinical Triage Support (offline edge deployment)
-================================================================
-Fully offline after a one-time `python setup_models.py` run (see that file).
-No internet connection is required or attempted at runtime — model_cache/
-is loaded with local_files_only=True so this is safe to run air-gapped on
-a Raspberry Pi 4/5 next to the dermatoscope.
+DermScript — Clinical Triage Support
+
+Two deployment modes, auto-detected by whether model_cache/ is pre-populated:
+  - Raspberry Pi / air-gapped: run `python setup_models.py` once with
+    internet access first, then this app runs fully offline.
+  - Streamlit Community Cloud: model_cache/ starts empty (can't ship a 436MB
+    BERT cache in a GitHub repo), so weights download once automatically at
+    first run, then stay cached for the container's lifetime.
 
 NOT a diagnostic device. Research / educational prototype only. Every
 output must be confirmed by a licensed clinician before any care decision.
@@ -26,8 +28,20 @@ APP_DIR = Path(__file__).parent
 CACHE_DIR = APP_DIR / "model_cache"
 os.environ["TORCH_HOME"] = str(CACHE_DIR / "torch")
 os.environ["HF_HOME"] = str(CACHE_DIR / "huggingface")
-os.environ["HF_HUB_OFFLINE"] = "1"          # never attempt a network call
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+# Only force fully-offline mode if a real pre-populated cache already exists
+# (the Raspberry Pi / `python setup_models.py` workflow). On Streamlit
+# Community Cloud there's no way to ship a 436MB BioClinicalBERT cache inside
+# a GitHub repo (well past GitHub's 100MB single-file limit without Git LFS),
+# so the cache is always empty on a fresh Cloud deploy -- forcing offline mode
+# unconditionally would crash on the very first model load. Let it download
+# once at first run instead (Streamlit Cloud has internet access); subsequent
+# reruns in the same session reuse Streamlit's @st.cache_resource in memory.
+_HF_CACHE_POPULATED = (CACHE_DIR / "huggingface" / "hub").exists()
+_TORCH_CACHE_POPULATED = (CACHE_DIR / "torch" / "hub" / "checkpoints").exists()
+if _HF_CACHE_POPULATED and _TORCH_CACHE_POPULATED:
+    os.environ["HF_HUB_OFFLINE"] = "1"          # never attempt a network call
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 BUNDLE_PATH = APP_DIR / "dermscript_inference_bundle.pkl"
 
@@ -137,18 +151,18 @@ def load_backbones():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # weights=None: we load ImageNet weights from the local torch cache
-    # populated by setup_models.py, not by re-downloading.
-    mnet = mobilenet_v3_large(weights=None)
-    state_dict_path = CACHE_DIR / "torch" / "hub" / "checkpoints" / "mobilenet_v3_large-5c1a4163.pth"
-    if state_dict_path.exists():
+    # On the Pi/offline path (cache already populated), load local weights
+    # without re-downloading. On Streamlit Cloud (cache empty on first run),
+    # download once instead of silently falling back to a random-init model
+    # -- the old fallback here would have produced meaningless risk scores
+    # with only a warning banner, which is far worse than a one-time download.
+    if _TORCH_CACHE_POPULATED:
+        mnet = mobilenet_v3_large(weights=None)
+        state_dict_path = CACHE_DIR / "torch" / "hub" / "checkpoints" / "mobilenet_v3_large-5c1a4163.pth"
         mnet.load_state_dict(torch.load(state_dict_path, map_location="cpu"))
     else:
-        st.warning(
-            "MobileNetV3 weights not found in model_cache/ — run setup_models.py "
-            "with internet access first. Falling back to random init (DO NOT "
-            "trust scores from this session)."
-        )
+        from torchvision.models import MobileNet_V3_Large_Weights
+        mnet = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.IMAGENET1K_V1)
     feat_extractor = mnet.features  # conv backbone, used for both pooled vector + Grad-CAM
     pool = mnet.avgpool
     mnet.classifier = nn.Identity()
@@ -157,8 +171,8 @@ def load_backbones():
         p.requires_grad_(False)
 
     bert_name = "emilyalsentzer/Bio_ClinicalBERT"
-    tok = AutoTokenizer.from_pretrained(bert_name, local_files_only=True)
-    bert = AutoModel.from_pretrained(bert_name, local_files_only=True).eval().to(device)
+    tok = AutoTokenizer.from_pretrained(bert_name, local_files_only=_HF_CACHE_POPULATED)
+    bert = AutoModel.from_pretrained(bert_name, local_files_only=_HF_CACHE_POPULATED).eval().to(device)
     for p in bert.parameters():
         p.requires_grad_(False)
 
@@ -607,4 +621,3 @@ st.markdown(
     </div>""",
     unsafe_allow_html=True,
 )
-
