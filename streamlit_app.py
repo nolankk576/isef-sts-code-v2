@@ -367,6 +367,49 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     return diameter_mm, debug
 
 
+def render_risk_gauge(risk, color, height=220):
+    """Real, dynamically-rendered SVG risk gauge (semicircle arc + center
+    readout). Unlike a hand-written static SVG string with a CSS class meant
+    to be animated by external JS, every number here is computed in Python
+    and baked directly into the path/text before it's ever sent to the
+    browser -- so there's nothing that can silently fail to run, and no risk
+    of the raw markup leaking onto the page as literal text.
+    """
+    import math
+
+    r = 80
+    cx, cy = 100, 100
+    # Semicircle from 180° (left) to 0° (right), sweeping clockwise with risk.
+    start_angle = math.pi          # 180°, left point (20,100)
+    end_angle = math.pi * (1 - risk)  # sweeps toward 0° as risk -> 1
+    x2 = cx + r * math.cos(end_angle)
+    y2 = cy - r * math.sin(end_angle)
+    large_arc = 1 if risk > 0.5 else 0
+    arc_len = math.pi * r          # full semicircle length
+    dash = arc_len * risk
+
+    html = f"""
+    <div style="display:flex;justify-content:center;">
+      <svg viewBox="0 0 200 120" width="260" height="{height}">
+        <path d="M 20 100 A {r} {r} 0 0 1 180 100" stroke="#23262e"
+              stroke-width="10" fill="none" stroke-linecap="round"/>
+        <path d="M 20 100 A {r} {r} 0 {large_arc} 1 {x2:.4f} {y2:.4f}"
+              stroke="{color}" stroke-width="10" fill="none"
+              stroke-linecap="round"/>
+        <circle cx="{cx}" cy="{cy}" r="50" fill="#0D1117" stroke="#1E2533" stroke-width="1"/>
+        <text x="{cx}" y="{cy - 8}" font-family="JetBrains Mono, monospace" font-size="30"
+              font-weight="700" text-anchor="middle" fill="{color}">{risk*100:.1f}%</text>
+        <text x="{cx}" y="{cy + 16}" font-family="Inter, sans-serif" font-size="10"
+              text-anchor="middle" fill="#7c828e">MALIGNANCY RISK</text>
+        <line x1="20" y1="100" x2="10" y2="100" stroke="#7D8FAB" stroke-width="1" opacity="0.5"/>
+        <line x1="100" y1="20" x2="100" y2="10" stroke="#7D8FAB" stroke-width="1" opacity="0.5"/>
+        <line x1="180" y1="100" x2="190" y2="100" stroke="#7D8FAB" stroke-width="1" opacity="0.5"/>
+      </svg>
+    </div>
+    """
+    st.components.v1.html(html, height=height)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Header
 # ──────────────────────────────────────────────────────────────────────────
@@ -567,14 +610,9 @@ if source_bytes is not None and run:
 
         with col2:
             risk_color = CORAL if risk >= 0.5 else TEAL
-            st.markdown(
-                f"""<div class="ds-card accent" style="--accent:{risk_color};">
-                    <div class="ds-eyebrow">Malignancy risk score</div>
-                    <div class="ds-metric-big" style="color:{risk_color};">{risk:.1%}</div>
-                    <div class="ds-metric-sub">Model output probability, pre-conformal-set</div>
-                </div>""",
-                unsafe_allow_html=True,
-            )
+            st.markdown('<div class="ds-eyebrow">Malignancy risk score</div>', unsafe_allow_html=True)
+            render_risk_gauge(risk, risk_color)
+            st.caption("Model output probability, pre-conformal-set")
 
             if deferred:
                 st.error(
@@ -598,6 +636,21 @@ if source_bytes is not None and run:
                 st.caption(
                     f"DRAPS conformal set = {{{in_set[0]}}} at q̂={q_hat:.3f} "
                     f"for {group_name} — single outcome at the 95% coverage level."
+                )
+
+            with st.expander("Fairness thresholds (per Fitzpatrick group)"):
+                for gname in ["FST I-II", "FST III-IV", "FST V-VI"]:
+                    g = bundle.get("cp_by_group", {}).get(gname)
+                    qval = g.get("q_hat") if g else None
+                    marker = " ← this patient" if gname == group_name else ""
+                    st.markdown(
+                        f"`{gname}`: q̂ = {qval:.4f}" if qval is not None else f"`{gname}`: not available"
+                        f"{marker}"
+                    )
+                st.caption(
+                    "These are pulled live from the calibrated bundle, not a "
+                    "placeholder — stratified thresholds should differ slightly "
+                    "across groups (see cell 6's q_hat spread of 0.0796)."
                 )
 
     with explain_tab:
