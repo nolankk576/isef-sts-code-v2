@@ -15,6 +15,7 @@ output must be confirmed by a licensed clinician before any care decision.
 import io
 import os
 import pickle
+import zipfile
 from pathlib import Path
 
 import cv2
@@ -44,13 +45,48 @@ if _HF_CACHE_POPULATED and _TORCH_CACHE_POPULATED:
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 BUNDLE_PATH = APP_DIR / "dermscript_inference_bundle.pkl"
+# The pkl itself (~102MB) is over GitHub's 100MB per-file push limit (without
+# Git LFS), but a zip of it (~95MB per your compression) fits. Commit ONLY
+# this zip to the repo -- never commit the raw .pkl -- and this block
+# extracts it into place on first run of a fresh container. Safe to leave in
+# permanently: once BUNDLE_PATH exists, this is a no-op on every later rerun.
+BUNDLE_ZIP_PATH = APP_DIR / "dermscript_inference_bundle.zip"
 
-# ── Physical hardware constants (measure from your actual CAD model / print) ─
-# The Contact Ring has four 5x1mm ruler bumps. RING_BUMP_SPACING_MM is the
-# real-world center-to-center distance between adjacent bumps on the printed
-# ring -- measure this on your physical part and set it here; it is the
-# single ground-truth length the whole pixel->mm conversion depends on.
-RING_BUMP_SPACING_MM = 20.0   # << MEASURE YOUR PRINTED RING AND UPDATE THIS
+
+def ensure_bundle_extracted():
+    """Extract dermscript_inference_bundle.zip -> dermscript_inference_bundle.pkl
+    if the pkl isn't already present on disk. Handles a zip that contains the
+    .pkl either at its root or nested one folder deep (e.g. if it was zipped
+    as a folder rather than a single file), and works whether the entry is
+    named exactly 'dermscript_inference_bundle.pkl' or something else -- it
+    just takes the first (and normally only) .pkl file found inside."""
+    if BUNDLE_PATH.exists():
+        return True, None
+    if not BUNDLE_ZIP_PATH.exists():
+        return False, (
+            f"Neither {BUNDLE_PATH.name} nor {BUNDLE_ZIP_PATH.name} found next "
+            f"to app.py. Commit the zip to the repo (never the raw .pkl -- "
+            f"it's too large for a plain GitHub push)."
+        )
+    try:
+        with zipfile.ZipFile(BUNDLE_ZIP_PATH, "r") as zf:
+            pkl_entries = [n for n in zf.namelist() if n.lower().endswith(".pkl")]
+            if not pkl_entries:
+                return False, f"{BUNDLE_ZIP_PATH.name} exists but contains no .pkl file."
+            # If more than one .pkl is in the zip, prefer an exact filename
+            # match; otherwise just take the first one found.
+            target_name = BUNDLE_PATH.name
+            chosen = next((n for n in pkl_entries if Path(n).name == target_name), pkl_entries[0])
+            with zf.open(chosen) as src, open(BUNDLE_PATH, "wb") as dst:
+                dst.write(src.read())
+        return True, None
+    except zipfile.BadZipFile:
+        return False, f"{BUNDLE_ZIP_PATH.name} is not a valid zip file (re-export it and re-upload)."
+    except Exception as e:
+        return False, f"Failed to extract {BUNDLE_ZIP_PATH.name}: {e}"
+
+
+_bundle_extracted_ok, _bundle_extract_error = ensure_bundle_extracted()
 
 # ──────────────────────────────────────────────────────────────────────────
 # Theme — "calibration instrument" aesthetic: dark optics-bench backdrop,
@@ -478,7 +514,11 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────────────────
 bundle_ok = BUNDLE_PATH.exists()
 if not bundle_ok:
-    st.error(f"Model bundle not found at `{BUNDLE_PATH}`. Copy `dermscript_inference_bundle.pkl` next to `app.py`.")
+    if _bundle_extract_error:
+        st.error(f"Model bundle unavailable — {_bundle_extract_error}")
+    else:
+        st.error(f"Model bundle not found at `{BUNDLE_PATH}`. Copy `dermscript_inference_bundle.pkl` "
+                 f"(or a zip of it) next to `app.py`.")
     st.stop()
 
 bundle = load_bundle()
