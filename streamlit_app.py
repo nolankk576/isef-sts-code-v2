@@ -385,31 +385,86 @@ def shap_breakdown(bundle, X, vis_dim, nlp_dim, max_display=12):
     )
 
 
-def render_shap_waterfall(explanation, max_display=12):
-    """Renders the real single-instance SHAP waterfall (matplotlib, via
-    shap.plots.waterfall) as a static image in Streamlit -- this is the
-    standard SHAP chart for one prediction, unlike the multi-sample beeswarm
-    plot which needs a whole batch of samples to be meaningful."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import shap
+def render_shap_waterfall(explanation, max_display=12, width=760):
+    """Renders a single-instance SHAP waterfall as hand-built SVG -- same
+    approach as render_risk_gauge() above. Deliberately avoids matplotlib:
+    Streamlit Cloud containers don't have it unless it's pinned in
+    requirements.txt, and shap.plots.waterfall requires it. This draws the
+    same information (base value -> stepped contributions -> final output)
+    with no extra dependency.
+    """
+    values = np.asarray(explanation.values).reshape(-1)
+    names = list(explanation.feature_names)
+    base_value = float(explanation.base_values)
 
-    fig = plt.figure()
-    shap.plots.waterfall(explanation, max_display=max_display, show=False)
-    fig = plt.gcf()
-    fig.patch.set_facecolor("#0a0b0e")
-    for ax in fig.axes:
-        ax.set_facecolor("#0a0b0e")
-        ax.tick_params(colors="#f2f3f5")
-        ax.xaxis.label.set_color("#f2f3f5")
-        for text in ax.texts:
-            text.set_color("#f2f3f5")
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    buf.seek(0)
-    return buf
+    # Keep the top-N components by |impact|, fold the rest into "other".
+    order = np.argsort(-np.abs(values))
+    top_idx = order[:max_display]
+    rest_idx = order[max_display:]
+
+    rows = [(names[i], values[i]) for i in top_idx]
+    if len(rest_idx) > 0:
+        rows.append((f"{len(rest_idx)} other components", float(values[rest_idx].sum())))
+
+    # Waterfall runs bottom-to-top in most SHAP plots; replicate that order.
+    rows = rows[::-1]
+
+    final_value = base_value + sum(v for _, v in rows)
+    all_vals = [base_value] + [base_value + sum(v for _, v in rows[:i + 1]) for i in range(len(rows))]
+    lo, hi = min(all_vals), max(all_vals)
+    span = max(hi - lo, 1e-6)
+    pad = span * 0.15
+    lo, hi = lo - pad, hi + pad
+
+    row_h = 34
+    top_margin = 40
+    bottom_margin = 50
+    height = top_margin + row_h * len(rows) + bottom_margin
+    label_w = 230
+    plot_w = width - label_w - 90
+
+    def x_of(v):
+        return label_w + (v - lo) / (hi - lo) * plot_w
+
+    bars = []
+    running = base_value
+    for i, (name, val) in enumerate(rows):
+        y = top_margin + i * row_h
+        start = running
+        end = running + val
+        running = end
+        x1, x2 = x_of(start), x_of(end)
+        left, right = min(x1, x2), max(x1, x2)
+        color = CORAL if val >= 0 else TEAL
+        sign = "+" if val >= 0 else ""
+        bars.append(f"""
+          <text x="{label_w - 10}" y="{y + row_h/2 + 4}" text-anchor="end"
+                font-family="JetBrains Mono, monospace" font-size="11" fill="{INK}">{name}</text>
+          <rect x="{left:.1f}" y="{y + 6}" width="{max(right-left, 2):.1f}" height="{row_h - 14}"
+                fill="{color}" opacity="0.85" rx="2"/>
+          <text x="{right + 8:.1f}" y="{y + row_h/2 + 4}"
+                font-family="JetBrains Mono, monospace" font-size="10.5" fill="{color}">{sign}{val:.3f}</text>
+        """)
+
+    base_x = x_of(base_value)
+    final_x = x_of(final_value)
+
+    svg = f"""
+    <div style="display:flex;justify-content:center;">
+      <svg viewBox="0 0 {width} {height}" width="{width}" height="{height}">
+        <line x1="{base_x:.1f}" y1="{top_margin - 10}" x2="{base_x:.1f}" y2="{height - bottom_margin + 10}"
+              stroke="{MUTED}" stroke-width="1" stroke-dasharray="3,3" opacity="0.5"/>
+        <text x="{base_x:.1f}" y="{top_margin - 16}" text-anchor="middle"
+              font-family="JetBrains Mono, monospace" font-size="10" fill="{MUTED}">base {base_value:.3f}</text>
+        {"".join(bars)}
+        <line x1="{final_x:.1f}" y1="{top_margin - 10}" x2="{final_x:.1f}" y2="{height - bottom_margin + 10}"
+              stroke="{AMBER}" stroke-width="1.5" opacity="0.8"/>
+        <text x="{final_x:.1f}" y="{height - bottom_margin + 26}" text-anchor="middle"
+              font-family="JetBrains Mono, monospace" font-size="11" font-weight="700" fill="{AMBER}">f(x) = {final_value:.3f}</text>
+      </svg>
+    </div>
+    """
+    return svg
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -815,8 +870,8 @@ if source_bytes is not None and run:
             st.markdown("**SHAP — this lesion's prediction**")
             try:
                 vis_pct, txt_pct, explanation, is_vis = shap_breakdown(bundle, X, vis_dim, nlp_dim)
-                waterfall_buf = render_shap_waterfall(explanation)
-                st.image(waterfall_buf, use_container_width=True)
+                waterfall_svg = render_shap_waterfall(explanation)
+                st.components.v1.html(waterfall_svg, height=520)
                 st.caption(
                     f"Waterfall for this single lesion: starts at the model's average "
                     f"output (base value) and shows how each PCA component pushed the "
