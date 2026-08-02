@@ -1,23 +1,19 @@
 """
 DermScript — Clinical Triage Support
-
 Two deployment modes, auto-detected by whether model_cache/ is pre-populated:
   - Raspberry Pi / air-gapped: run `python setup_models.py` once with
     internet access first, then this app runs fully offline.
   - Streamlit Community Cloud: model_cache/ starts empty (can't ship a 436MB
     BERT cache in a GitHub repo), so weights download once automatically at
     first run, then stay cached for the container's lifetime.
-
 NOT a diagnostic device. Research / educational prototype only. Every
 output must be confirmed by a licensed clinician before any care decision.
 """
-
 import io
 import os
 import pickle
 import zipfile
 from pathlib import Path
-
 import cv2
 import numpy as np
 import requests
@@ -45,12 +41,27 @@ if _HF_CACHE_POPULATED and _TORCH_CACHE_POPULATED:
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 BUNDLE_PATH = APP_DIR / "dermscript_inference_bundle.pkl"
+
 # The pkl itself (~102MB) is over GitHub's 100MB per-file push limit (without
 # Git LFS), but a zip of it (~95MB per your compression) fits. Commit ONLY
 # this zip to the repo -- never commit the raw .pkl -- and this block
 # extracts it into place on first run of a fresh container. Safe to leave in
 # permanently: once BUNDLE_PATH exists, this is a no-op on every later rerun.
 BUNDLE_ZIP_PATH = APP_DIR / "dermscript_inference_bundle.zip"
+
+# Physical spacing (mm) between adjacent ruler bumps on the printed Contact
+# Ring, measured center-to-center on the physical ring itself. This is the
+# scale factor that converts detected pixel distances into millimeters for
+# the lesion diameter estimate below. MUST match your actual printed ring --
+# recalibrate this value (with calipers against the real ring) if you ever
+# reprint the Contact Ring at a different size or bump layout.
+RING_BUMP_SPACING_MM = 10.0  # <-- replace with your ring's measured spacing
+
+# Minimum number of detected ruler bumps required before trusting the
+# px->mm scale. 2 points give a single pairwise distance with no way to
+# cross-check it against noise; 3+ points let us sanity-check consistency
+# across multiple pairwise distances before using the average.
+MIN_BUMPS_FOR_SCALE = 3
 
 
 def ensure_bundle_extracted():
@@ -98,48 +109,39 @@ TEAL, CORAL, PUR, AMBER, BG, PANEL, LINE, INK, MUTED = (
     "#3fd6a8", "#ff6b81", "#a78bfa", "#e8a33d",
     "#0a0b0e", "#13151a", "#23262e", "#f2f3f5", "#7c828e",
 )
-
 st.markdown(
     f"""<style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap');
-
     html, body, [class*="css"] {{ font-family:'Inter',sans-serif; }}
     .stApp {{ background:{BG}; }}
     #MainMenu, header[data-testid="stHeader"] {{ background:transparent; }}
-
     h1, h2, h3 {{ color:{INK} !important; font-weight:700 !important; letter-spacing:-0.01em; }}
     p, label, .stMarkdown {{ color:{INK}; }}
     [data-testid="stCaptionContainer"], .stCaption {{ color:{MUTED} !important; }}
-
     /* Tick-rule header bar — nods to the Contact Ring's ruler bumps */
     .ds-tickrule {{
         height:6px; margin:-0.4rem 0 1.1rem 0; border-radius:3px;
         background:repeating-linear-gradient(90deg,{AMBER} 0 2px, transparent 2px 18px);
         opacity:0.55;
     }}
-
     .ds-eyebrow {{
         font-family:'JetBrains Mono',monospace; font-size:0.72rem; letter-spacing:0.12em;
         color:{MUTED}; text-transform:uppercase; margin-bottom:0.15rem;
     }}
-
     .ds-card {{
         background:{PANEL}; border:1px solid {LINE}; border-radius:10px;
         padding:1.15rem 1.35rem; margin-bottom:0.8rem;
     }}
     .ds-card.accent {{ border-left:3px solid var(--accent,{TEAL}); }}
-
     .ds-metric-big {{
         font-family:'JetBrains Mono',monospace; font-size:2.6rem; font-weight:700;
         line-height:1.05;
     }}
     .ds-metric-sub {{ font-size:0.85rem; color:{MUTED}; margin-top:0.3rem; }}
-
     .ds-pill {{
         display:inline-block; padding:0.3rem 0.85rem; border-radius:999px;
         font-weight:600; font-size:0.88rem; font-family:'JetBrains Mono',monospace;
     }}
-
     .ds-status-row {{ display:flex; gap:0.6rem; flex-wrap:wrap; margin-bottom:0.4rem; }}
     .ds-status {{
         font-family:'JetBrains Mono',monospace; font-size:0.78rem; padding:0.25rem 0.65rem;
@@ -148,25 +150,20 @@ st.markdown(
     .ds-status.ok {{ color:{TEAL}; border-color:{TEAL}44; }}
     .ds-status.warn {{ color:{AMBER}; border-color:{AMBER}44; }}
     .ds-status.bad {{ color:{CORAL}; border-color:{CORAL}44; }}
-
     .ds-footer {{
         font-family:'JetBrains Mono',monospace; font-size:0.78rem; color:{MUTED};
         line-height:1.6; border-top:1px solid {LINE}; padding-top:1rem; margin-top:0.5rem;
     }}
-
     .stButton>button {{ border-radius:8px; font-weight:600; border:1px solid {LINE}; }}
     .stButton>button[kind="primary"] {{ background:{CORAL}; border:none; color:#1a0a0d; }}
     .stButton>button[kind="primary"]:hover {{ background:#ff8595; }}
-
     [data-testid="stSidebar"] {{ background:{PANEL}; border-right:1px solid {LINE}; }}
     [data-testid="stMetricValue"] {{ font-family:'JetBrains Mono',monospace; }}
-
     .stTabs [data-baseweb="tab"] {{ font-weight:600; color:{MUTED}; }}
     .stTabs [aria-selected="true"] {{ color:{INK} !important; }}
     </style>""",
     unsafe_allow_html=True,
 )
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # Model loading — fully offline, cached once per process
@@ -183,6 +180,7 @@ def load_backbones():
     import torch.nn as nn
     from torchvision import transforms
     from torchvision.models import mobilenet_v3_large
+
     from transformers import AutoTokenizer, AutoModel
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -199,6 +197,7 @@ def load_backbones():
     else:
         from torchvision.models import MobileNet_V3_Large_Weights
         mnet = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.IMAGENET1K_V1)
+
     feat_extractor = mnet.features  # conv backbone, used for both pooled vector + Grad-CAM
     pool = mnet.avgpool
     mnet.classifier = nn.Identity()
@@ -243,15 +242,18 @@ def embed(image, text, device, mnet, tok, bert, img_tf, tta=True):
         imgs = [image]
 
     t_orig = img_tf(image).unsqueeze(0).to(device)  # used for Grad-CAM (must match what's shown)
+
     vecs = []
     with torch.no_grad():
         for im in imgs:
             t = img_tf(im).unsqueeze(0).to(device)
             vecs.append(mnet(t).float().cpu().numpy())
         v = np.mean(vecs, axis=0)
+
         enc = tok([text or "Dermoscopy image."], padding=True, truncation=True,
                   max_length=64, return_tensors="pt").to(device)
         n = bert(**enc).last_hidden_state[:, 0, :].float().cpu().numpy()
+
     return np.hstack([v, n]), t_orig
 
 
@@ -270,9 +272,11 @@ def grad_cam(image_tensor, mnet, feat_extractor, pool, device):
         activations["act"] = out
 
     handle = feat_extractor[-1].register_forward_hook(fwd_hook)
+
     image_tensor = image_tensor.clone().requires_grad_(True)
     feats = feat_extractor(image_tensor)
     pooled = pool(feats).flatten(1)
+
     # Proxy scalar target: L2 norm of the pooled embedding. Gradients of this
     # w.r.t. the last conv activations show which spatial regions drive the
     # overall visual representation the classifier downstream consumes.
@@ -310,6 +314,7 @@ def overlay_heatmap(pil_img, cam):
 def shap_breakdown(bundle, X, vis_dim, nlp_dim):
     """Pulls one fitted (scaler, pca, lgbm) pipeline out of the
     CalibratedClassifierCV wrapper and runs a real TreeExplainer on it.
+
     Reports contribution split between vision-derived and text-derived
     input features (honest granularity -- NOT a specific-biomarker claim)."""
     import shap
@@ -340,6 +345,7 @@ def shap_breakdown(bundle, X, vis_dim, nlp_dim):
     vision_contrib = np.abs(sv[is_vision_dominant]).sum()
     text_contrib = np.abs(sv[~is_vision_dominant]).sum()
     total = vision_contrib + text_contrib + 1e-9
+
     return vision_contrib / total, text_contrib / total, sv, is_vision_dominant
 
 
@@ -347,7 +353,7 @@ def shap_breakdown(bundle, X, vis_dim, nlp_dim):
 # Ruler-bump homography: detect the 4 physical bumps, compute mm/px scale
 # ──────────────────────────────────────────────────────────────────────────
 def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
-    """Detects 4 small bright circular bumps near the image border (the
+    """Detects small bright circular bumps near the image border (the
     Contact Ring's ruler bumps) via Hough circle detection, uses their
     known real-world spacing (RING_BUMP_SPACING_MM) to get a px->mm scale,
     then estimates lesion diameter from a simple contour/threshold pass on
@@ -356,7 +362,7 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     This needs real calibration against your actual printed ring under your
     actual lighting -- treat the Hough parameters below as a starting point,
     not a finished calibration. Returns (diameter_mm, debug_image) or
-    (None, debug_image) if fewer than 2 bumps are found.
+    (None, debug_image) if fewer than MIN_BUMPS_FOR_SCALE bumps are found.
     """
     gray = cv2.cvtColor(cv_img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.medianBlur(gray, 5)
@@ -368,7 +374,8 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     )
 
     debug = cv_img_bgr.copy()
-    if circles is None or len(circles[0]) < 2:
+
+    if circles is None or len(circles[0]) < MIN_BUMPS_FOR_SCALE:
         cv2.putText(debug, "Ruler bumps not detected", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         return None, debug
@@ -382,8 +389,10 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     for i in range(len(pts)):
         for j in range(i + 1, len(pts)):
             dists.append(np.linalg.norm(pts[i] - pts[j]))
+
     if not dists:
         return None, debug
+
     px_per_mm = float(np.mean(dists)) / RING_BUMP_SPACING_MM
     if px_per_mm <= 0:
         return None, debug
@@ -393,6 +402,7 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None, debug
+
     center = np.array([w / 2, h / 2])
     contours = sorted(contours, key=lambda c: np.linalg.norm(
         np.array(cv2.minEnclosingCircle(c)[0]) - center))
@@ -415,6 +425,7 @@ def render_risk_gauge(risk, color, height=220):
 
     r = 80
     cx, cy = 100, 100
+
     # Semicircle from 180° (left) to 0° (right), sweeping clockwise with risk.
     start_angle = math.pi          # 180°, left point (20,100)
     end_angle = math.pi * (1 - risk)  # sweeps toward 0° as risk -> 1
@@ -471,7 +482,6 @@ with st.sidebar:
          "Lower extremity", "Palms/Soles", "Other"],
     )
     fitz = st.select_slider("Fitzpatrick skin type", options=["I", "II", "III", "IV", "V", "VI"], value="III")
-
     with st.expander("Clinical observation (optional)"):
         note = st.text_area(
             "Notes",
@@ -479,7 +489,6 @@ with st.sidebar:
             height=100,
             label_visibility="collapsed",
         )
-
     st.divider()
     st.markdown('<div class="ds-eyebrow">DermScript device</div>', unsafe_allow_html=True)
     device_ip = st.text_input(
@@ -606,7 +615,6 @@ if source_bytes is not None and run:
     # device, mnet, feat_extractor, pool, tok, bert, img_tf already loaded
     # eagerly above (status row) -- no need to call load_backbones() again,
     # @st.cache_resource would just return the same cached objects anyway.
-
     full_note = f"Age {age}, {sex}, site: {site}. {note}".strip()
 
     with st.spinner("Running multimodal inference…"):
@@ -683,10 +691,10 @@ if source_bytes is not None and run:
                     g = bundle.get("cp_by_group", {}).get(gname)
                     qval = g.get("q_hat") if g else None
                     marker = " ← this patient" if gname == group_name else ""
-                    st.markdown(
-                        f"`{gname}`: q̂ = {qval:.4f}" if qval is not None else f"`{gname}`: not available"
-                        f"{marker}"
-                    )
+                    if qval is not None:
+                        st.markdown(f"`{gname}`: q̂ = {qval:.4f}{marker}")
+                    else:
+                        st.markdown(f"`{gname}`: not available{marker}")
                 st.caption(
                     "These are pulled live from the calibrated bundle, not a "
                     "placeholder — stratified thresholds should differ slightly "
