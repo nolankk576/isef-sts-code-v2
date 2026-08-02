@@ -311,12 +311,18 @@ def overlay_heatmap(pil_img, cam):
 # ──────────────────────────────────────────────────────────────────────────
 # Real SHAP on the underlying LightGBM step (one of the calibrated folds)
 # ──────────────────────────────────────────────────────────────────────────
-def shap_breakdown(bundle, X, vis_dim, nlp_dim):
+def shap_breakdown(bundle, X, vis_dim, nlp_dim, max_display=12):
     """Pulls one fitted (scaler, pca, lgbm) pipeline out of the
-    CalibratedClassifierCV wrapper and runs a real TreeExplainer on it.
+    CalibratedClassifierCV wrapper and runs a real TreeExplainer on it for
+    THIS single lesion.
 
-    Reports contribution split between vision-derived and text-derived
-    input features (honest granularity -- NOT a specific-biomarker claim)."""
+    A beeswarm plot (dots spread across a population of samples) isn't the
+    right chart for a single-image inference -- with n=1 every "swarm" is
+    just one dot per feature. The correct idiomatic SHAP visualization for
+    one instance is a waterfall: it shows the model's baseline (expected)
+    output, then each top feature's push up or down, ending at this specific
+    lesion's predicted value. Returns everything render_shap_waterfall()
+    needs, plus the aggregate vision/text split used in the caption."""
     import shap
 
     cal_model = bundle["model"]
@@ -330,13 +336,26 @@ def shap_breakdown(bundle, X, vis_dim, nlp_dim):
     lgbm = sub_pipe.named_steps["clf"]
 
     explainer = shap.TreeExplainer(lgbm)
-    sv = explainer.shap_values(Xp)
-    sv = sv[1] if isinstance(sv, list) else sv  # positive-class shap values
-    sv = np.asarray(sv).reshape(-1)
+    explanation = explainer(Xp)  # shap.Explanation, supports multi-class or binary output
 
-    # Map each PCA component's |SHAP| back to its dominant source modality
-    # via the PCA loading weights, then aggregate -- real numbers, coarse
-    # granularity, no biomarker-name fabrication.
+    # Normalize to a single 1-D array of per-component SHAP values for the
+    # positive (malignant) class, and a scalar base value to match.
+    if explanation.values.ndim == 3:
+        # (n_samples, n_features, n_classes) -- take positive class, sample 0
+        sv = explanation.values[0, :, 1]
+        base_value = explanation.base_values[0, 1]
+    else:
+        # (n_samples, n_features) -- already binary/single-output
+        sv = explanation.values[0]
+        base_value = explanation.base_values[0]
+        base_value = float(np.asarray(base_value).reshape(-1)[0])
+
+    sv = np.asarray(sv).reshape(-1)
+    feature_values = np.asarray(Xp[0]).reshape(-1)
+
+    # Map each PCA component back to its dominant source modality via the
+    # PCA loading weights -- real numbers, coarse granularity, no
+    # biomarker-name fabrication.
     loadings = sub_pipe.named_steps["pca"].components_  # (n_pca, vis_dim+nlp_dim)
     vision_mass = np.abs(loadings[:, :vis_dim]).sum(axis=1)
     text_mass = np.abs(loadings[:, vis_dim:]).sum(axis=1)
@@ -346,7 +365,51 @@ def shap_breakdown(bundle, X, vis_dim, nlp_dim):
     text_contrib = np.abs(sv[~is_vision_dominant]).sum()
     total = vision_contrib + text_contrib + 1e-9
 
-    return vision_contrib / total, text_contrib / total, sv, is_vision_dominant
+    feature_names = [
+        f"PC{i+1} ({'vision' if is_vision_dominant[i] else 'text'})"
+        for i in range(len(sv))
+    ]
+
+    single_explanation = shap.Explanation(
+        values=sv,
+        base_values=base_value,
+        data=feature_values,
+        feature_names=feature_names,
+    )
+
+    return (
+        vision_contrib / total,
+        text_contrib / total,
+        single_explanation,
+        is_vision_dominant,
+    )
+
+
+def render_shap_waterfall(explanation, max_display=12):
+    """Renders the real single-instance SHAP waterfall (matplotlib, via
+    shap.plots.waterfall) as a static image in Streamlit -- this is the
+    standard SHAP chart for one prediction, unlike the multi-sample beeswarm
+    plot which needs a whole batch of samples to be meaningful."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import shap
+
+    fig = plt.figure()
+    shap.plots.waterfall(explanation, max_display=max_display, show=False)
+    fig = plt.gcf()
+    fig.patch.set_facecolor("#0a0b0e")
+    for ax in fig.axes:
+        ax.set_facecolor("#0a0b0e")
+        ax.tick_params(colors="#f2f3f5")
+        ax.xaxis.label.set_color("#f2f3f5")
+        for text in ax.texts:
+            text.set_color("#f2f3f5")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -636,6 +699,41 @@ if source_bytes is not None and run:
         in_set = ["benign", "malignant"]
     deferred = len(in_set) > 1
 
+    with st.expander("🔧 Debug — bundle & inference sanity checks"):
+        try:
+            classes_ = getattr(bundle["model"], "classes_", None)
+            st.markdown(f"`model.classes_` = `{classes_}` "
+                        f"— index 1 (used by `predict_proba(X)[:, 1]`) should "
+                        f"correspond to the MALIGNANT class. If this is reversed "
+                        f"or unexpected, the risk score is silently flipped.")
+        except Exception as e:
+            st.markdown(f"Could not read `model.classes_`: {e}")
+
+        expected_dim = vis_dim + nlp_dim
+        actual_dim = X.shape[1] if hasattr(X, "shape") else None
+        dim_ok = actual_dim == expected_dim
+        st.markdown(
+            f"Feature vector: `X.shape` = `{getattr(X, 'shape', None)}` vs "
+            f"expected `vis_dim + nlp_dim` = `{expected_dim}` "
+            f"({'✓ match' if dim_ok else '✗ MISMATCH — scaler/PCA inputs are misaligned'})."
+        )
+
+        cp_by_group = bundle.get("cp_by_group", {})
+        expected_groups = ["FST I-II", "FST III-IV", "FST V-VI"]
+        missing = [g for g in expected_groups if g not in cp_by_group]
+        if missing:
+            st.markdown(
+                f"`cp_by_group` is missing keys: `{missing}` — fairness panel will "
+                f"show 'not available' for these. Likely a stale/partial bundle."
+            )
+        else:
+            st.markdown("`cp_by_group` has all three expected Fitzpatrick group keys. ✓")
+
+        st.caption(
+            "This panel is here so a mis-keyed or stale bundle shows up immediately "
+            "in the UI, instead of only being caught later by an unexpected score."
+        )
+
     st.divider()
     result_tab, explain_tab = st.tabs(["📊  Risk & Sizing", "🧭  Explainability"])
 
@@ -714,19 +812,19 @@ if source_bytes is not None and run:
                 st.warning(f"Grad-CAM unavailable this run: {e}")
 
         with xcol2:
-            st.markdown("**SHAP — modality contribution**")
+            st.markdown("**SHAP — this lesion's prediction**")
             try:
-                vis_pct, txt_pct, sv, is_vis = shap_breakdown(bundle, X, vis_dim, nlp_dim)
-                st.bar_chart(
-                    {"Vision (image)": [vis_pct], "Clinical text": [txt_pct]},
-                    use_container_width=True,
-                )
+                vis_pct, txt_pct, explanation, is_vis = shap_breakdown(bundle, X, vis_dim, nlp_dim)
+                waterfall_buf = render_shap_waterfall(explanation)
+                st.image(waterfall_buf, use_container_width=True)
                 st.caption(
-                    "Share of total |SHAP| attribution coming from PCA components "
-                    "dominated by image vs. text input features. This is real model "
-                    "introspection at the modality level — it does NOT identify "
-                    "specific biological biomarkers, which this model was never "
-                    "trained to predict."
+                    f"Waterfall for this single lesion: starts at the model's average "
+                    f"output (base value) and shows how each PCA component pushed the "
+                    f"prediction up or down to reach this result. Roughly "
+                    f"{vis_pct*100:.0f}% of total attribution came from vision-dominated "
+                    f"components vs. {txt_pct*100:.0f}% from text-dominated ones. This "
+                    f"does NOT identify specific biological biomarkers, which this model "
+                    f"was never trained to predict."
                 )
             except Exception as e:
                 st.warning(f"SHAP unavailable this run: {e}")
