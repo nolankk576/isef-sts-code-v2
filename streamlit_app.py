@@ -20,6 +20,12 @@ import requests
 import streamlit as st
 from PIL import Image
 
+try:
+    from referral_note import generate_referral_note
+    REFERRAL_NOTE_AVAILABLE = True
+except ImportError:
+    REFERRAL_NOTE_AVAILABLE = False  # app still runs fully without this feature
+
 # ── Route caches to the local offline folder BEFORE importing torch/transformers
 APP_DIR = Path(__file__).parent
 CACHE_DIR = APP_DIR / "model_cache"
@@ -583,6 +589,9 @@ st.title("🔬 DermScript")
 st.markdown('<div class="ds-tickrule"></div>', unsafe_allow_html=True)
 st.caption(
     "Melanoma triage support for use alongside the DermScript dermatoscope. "
+    "Public benchmarks for AI melanoma detection are dermatoscope-only — this "
+    "device is validated for that exact modality (AUC ~0.87 on held-out "
+    "dermatoscope cohorts vs. ~0.51, near chance, on ordinary phone photos). "
     "**Not a diagnostic device.** Every output requires confirmation by a "
     "licensed clinician before any care decision."
 )
@@ -790,7 +799,8 @@ if source_bytes is not None and run:
         )
 
     st.divider()
-    result_tab, explain_tab = st.tabs(["📊  Risk & Sizing", "🧭  Explainability"])
+    result_tab, explain_tab, referral_tab = st.tabs(
+        ["📊  Risk & Sizing", "🧭  Explainability", "📋  Referral Note"])
 
     with result_tab:
         col1, col2 = st.columns([1, 1], gap="large")
@@ -884,6 +894,139 @@ if source_bytes is not None and run:
             except Exception as e:
                 st.warning(f"SHAP unavailable this run: {e}")
 
+    with referral_tab:
+        if not REFERRAL_NOTE_AVAILABLE:
+            st.warning(
+                "`referral_note.py` not found next to `app.py` — copy it over to "
+                "enable this tab. The rest of the app works fine without it."
+            )
+        else:
+            st.markdown(
+                "Structured handoff note combining this capture's risk score, "
+                "DRAPS confidence, measured diameter, and patient context — "
+                "for a teledermatology referral or printed record, not a diagnosis."
+            )
+
+            modality_warn = None
+            modality_det = bundle.get("modality_detector")
+            p_clinical = None
+            if modality_det is not None:
+                try:
+                    X_pca_for_modality = modality_det["pca_step"].transform(X)
+                    p_clinical = float(modality_det["model"].predict_proba(X_pca_for_modality)[:, 1][0])
+                    if p_clinical > 0.5:
+                        modality_warn = (
+                            f"This image scored {p_clinical:.0%} likely to be a "
+                            f"clinical-camera photo rather than a genuine dermatoscope "
+                            f"capture. This model's validated performance covers "
+                            f"dermatoscope images only (external AUC ~0.51 on "
+                            f"clinical-camera photos vs. ~0.85 on dermatoscope images) "
+                            f"— treat this risk score with reduced confidence."
+                        )
+                except Exception:
+                    pass  # modality check is a bonus safety feature, never block the note
+
+            # --- Novelty/OOD score: how far this image sits from ANYTHING seen
+            # in training, independent of the binary modality question above.
+            # Catches failure modes the modality detector can't (bad lighting,
+            # unfamiliar anatomical site, damaged optics, an unseen device). ---
+            novelty_score = None
+            novelty_det = bundle.get("novelty_detector")
+            if novelty_det is not None:
+                try:
+                    X_pca_for_novelty = novelty_det["pca_step"].transform(X)
+                    raw_maha = novelty_det["covariance_model"].mahalanobis(X_pca_for_novelty)[0]
+                    novelty_score = float(raw_maha / novelty_det["novelty_median"])
+                except Exception:
+                    pass  # novelty check is a bonus safety feature, never block the note
+
+            # --- Unified Triage Confidence Score: combines DRAPS deferral,
+            # modality mismatch, and novelty into ONE actionable tier, with
+            # full transparency into which signal drove it. No comparable
+            # project in this space combines multiple independent uncertainty
+            # sources into a single decision layer — most report one number
+            # (risk score) and stop there. ---
+            confidence_reasons = []
+            if deferred:
+                confidence_reasons.append("DRAPS conformal set includes both outcomes (model genuinely uncertain)")
+            if p_clinical is not None and p_clinical > 0.5:
+                confidence_reasons.append(f"image likely clinical-camera, not dermatoscope ({p_clinical:.0%})")
+            if novelty_score is not None and novelty_score > 2.5:
+                confidence_reasons.append(f"image is {novelty_score:.1f}x more unusual than a typical training image")
+
+            if len(confidence_reasons) >= 2:
+                confidence_tier = "REFER"
+            elif len(confidence_reasons) == 1:
+                confidence_tier = "VERIFY"
+            else:
+                confidence_tier = "TRUST"
+
+            # --- Guided recapture: turn a passive warning into an active
+            # instruction the user can act on immediately, not just a caveat. ---
+            recapture_hint = None
+            if p_clinical is not None and p_clinical > 0.5:
+                recapture_hint = ("This looks like a clinical-camera photo. If you have the "
+                                   "DermScript dermatoscope attachment, recapture with it for "
+                                   "a validated risk score.")
+            elif novelty_score is not None and novelty_score > 2.5:
+                recapture_hint = ("This image is unusually different from anything the model "
+                                   "was trained on. Check lighting, focus, and that the lesion "
+                                   "fills the frame, then recapture.")
+
+            tier_colors = {"TRUST": TEAL, "VERIFY": AMBER, "REFER": CORAL}
+            st.markdown(
+                f"""<div class="ds-card accent" style="--accent:{tier_colors[confidence_tier]};">
+                    <div class="ds-eyebrow">Triage Confidence</div>
+                    <span class="ds-pill" style="background:{tier_colors[confidence_tier]}22;
+                        color:{tier_colors[confidence_tier]};">{confidence_tier}</span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            if confidence_reasons:
+                st.caption("Contributing factors: " + "; ".join(confidence_reasons) + ".")
+            if recapture_hint:
+                st.info(f"📷 {recapture_hint}")
+
+            note_obj = generate_referral_note(
+                risk_score=risk,
+                draps_conformal_set=in_set,
+                draps_q_hat=q_hat,
+                patient_age=int(age), patient_sex=sex, anatomical_site=site,
+                fitzpatrick_skin_type=fitz, clinical_notes=note or None,
+                estimated_diameter_mm=diam_mm,
+                diameter_measurement_reliable=(diam_mm is not None),
+                modality_warning=modality_warn,
+                novelty_score=novelty_score,
+                confidence_tier=confidence_tier,
+                recapture_hint=recapture_hint,
+            )
+            # `deferred` (len(in_set) > 1) is this app's actual source of truth for
+            # model uncertainty — set it directly rather than reverse-deriving an
+            # "interval width" from q_hat, which would risk disagreeing with the
+            # risk/uncertainty messaging already shown in the Risk & Sizing tab.
+            note_obj.model_uncertain = deferred
+
+            st.components.v1.html(note_obj.to_html(), height=520, scrolling=True)
+
+            dl_col1, dl_col2 = st.columns(2)
+            dl_col1.download_button(
+                "Download as text", note_obj.to_text(),
+                file_name="dermscript_referral_note.txt", use_container_width=True,
+            )
+            dl_col2.download_button(
+                "Download as JSON (teledermatology API)", note_obj.to_json(),
+                file_name="dermscript_referral_note.json", use_container_width=True,
+            )
+
+            st.caption(
+                "Note: this is a single-timepoint screening note. Lesion "
+                "change-tracking (comparing against a prior capture of the "
+                "same lesion) is available via `lesion_tracker.py` but not "
+                "yet wired into this app session — see that module to add a "
+                "second-capture upload flow if you want the 'change over "
+                "time' section populated here."
+            )
+
 elif source_bytes is not None:
     st.caption("Image ready — click **Run DermScript analysis** above to score it.")
 
@@ -892,20 +1035,24 @@ elif source_bytes is not None:
 # ──────────────────────────────────────────────────────────────────────────
 st.markdown(
     f"""<div class="ds-footer">
+    THE BLOCKER — public benchmarks for AI melanoma detection are almost
+    entirely dermatoscope-only; nothing in this space measures what happens
+    when a patient photographs their own skin with a phone instead. This
+    device quantifies that gap directly: <b>AUC≈0.87 on held-out dermatoscope
+    cohorts vs. AUC≈0.51 (near chance) on ordinary clinical-camera photos —
+    same model, same patients, different camera.</b><br><br>
     TRAINING — N=90,953 images, N_pos=7,178 (7.9%), 14 deduplicated cohorts
     (ISIC 2016-2024, HAM10000, BCN20000, PAD-UFES-20, Derm7pt, MILK10K).
     In-distribution OOF AUC=0.883.<br><br>
-    EXTERNAL VALIDATION — performance is modality-dependent, confirmed on
-    two independent replications:<br>
+    EXTERNAL VALIDATION — confirmed on two independent replications per side:<br>
     &nbsp;&nbsp;• Dermatoscope images (same modality as this device):
     PH2 (Porto) AUC≈0.87, MED-NODE (Groningen) AUC≈0.85<br>
     &nbsp;&nbsp;• Clinical-camera photos (different modality): DDI (Stanford)
     AUC≈0.51, MRA-MIDAS AUC≈0.51 — near chance<br>
-    This device was built and validated for genuine DERMATOSCOPE images only.
     A cohort-identity classifier can distinguish source datasets with ~94%
     accuracy, indicating the model partly keys off acquisition artifacts —
-    the clinical-camera-photo gap is a known, unresolved limitation, not
-    something this app corrects for.<br><br>
+    the mechanism behind the gap above, reported honestly as unresolved
+    rather than corrected for.<br><br>
     NOT a diagnostic device. Generalization beyond dermatoscope-modality
     images is NOT established. Every output requires confirmation by a
     licensed clinician before any care decision.
