@@ -711,6 +711,32 @@ if source_bytes is not None and run:
         risk = float(specialist_bundle["model"].predict_proba(X)[:, 1][0])
         active_model = specialist_bundle["model"]
         risk_label = "MALIGNANT LESION RISK"
+
+        # v8.7: percentile rank + Youden's J threshold, if this bundle has
+        # them (older bundles won't until the notebook is rerun -- falls
+        # back gracefully to the plain caption below if missing).
+        oof_dist = specialist_bundle.get("oof_score_distribution_sorted")
+        op_thresh = specialist_bundle.get("operating_threshold_youden")
+        percentile_rank = None
+        if oof_dist is not None:
+            percentile_rank = float(np.searchsorted(oof_dist, risk) / len(oof_dist) * 100)
+
+        extra_bits = []
+        if percentile_rank is not None:
+            extra_bits.append(
+                f"This image scores higher than {percentile_rank:.0f}% of the "
+                f"specialist's own calibration images — a more informative "
+                f"read than the raw percentage above, since that number is "
+                f"compressed by this specialist's very low (1.55%) positive rate."
+            )
+        if op_thresh is not None:
+            above_below = "ABOVE" if risk >= op_thresh else "below"
+            extra_bits.append(
+                f"This model's own best decision threshold (Youden's J) is "
+                f"{op_thresh:.1%} — this image is {above_below} that threshold."
+            )
+        extra_caption = (" " + " ".join(extra_bits)) if extra_bits else ""
+
         risk_caption = (
             "Clinical-camera specialist model score (NOT the dermatoscope "
             "model). This specialist predicts a BROAD 'malignant lesion' "
@@ -724,7 +750,7 @@ if source_bytes is not None and run:
             "genuine malignant images — a LOW-looking number here is NOT "
             "evidence of benign. This branch is always treated as REFER "
             "regardless of the number shown."
-        )
+        ) + extra_caption
     else:
         risk = main_risk
         active_model = bundle["model"]
@@ -800,6 +826,11 @@ if source_bytes is not None and run:
         if use_specialist:
             oof = specialist_bundle.get("oof_auc_by_source", {})
             st.markdown(f"Specialist model per-source cross-validated AUC: `{oof}`")
+            if percentile_rank is not None:
+                st.markdown(f"Percentile rank vs. specialist's own calibration set: `{percentile_rank:.1f}%`")
+            if op_thresh is not None:
+                st.markdown(f"Specialist operating threshold (Youden's J): `{op_thresh:.4f}` "
+                            f"(this score is {'ABOVE' if risk >= op_thresh else 'below'} it)")
 
         st.caption(
             "This panel is here so a mis-keyed or stale bundle shows up immediately "
