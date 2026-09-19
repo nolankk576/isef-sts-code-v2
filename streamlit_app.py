@@ -718,7 +718,12 @@ if source_bytes is not None and run:
             "labels malignant/pre-malignant conditions generally, not just "
             "melanoma. Cross-validated AUC on held-out clinical-camera "
             "images: ~0.66-0.80 depending on source. Treat as a rougher "
-            "signal than the dermatoscope model's score."
+            "signal than the dermatoscope model's score. IMPORTANT: this "
+            "specialist trained on data where only 1.55% of images are "
+            "positive, so its calibrated scores rarely exceed 50% even for "
+            "genuine malignant images — a LOW-looking number here is NOT "
+            "evidence of benign. This branch is always treated as REFER "
+            "regardless of the number shown."
         )
     else:
         risk = main_risk
@@ -831,7 +836,20 @@ if source_bytes is not None and run:
                 )
 
         with col2:
-            risk_color = CORAL if risk >= 0.5 else TEAL
+            # FIX: the specialist model's positive rate in training is only
+            # 1.55% (609/39,301) -- calibrated probabilities from a model
+            # this imbalanced almost never exceed 50% even for genuine
+            # malignant images (same compression effect documented for the
+            # main model in the footer, worse here due to the lower base
+            # rate). The backend ALREADY treats every specialist-routed
+            # prediction as REFER-tier regardless of the number -- showing
+            # a green "LOW" pill next to that same score contradicted the
+            # REFER banner. Specialist branch now always renders amber,
+            # never green, matching what the REFER tier is already saying.
+            if use_specialist:
+                risk_color = AMBER
+            else:
+                risk_color = CORAL if risk >= 0.5 else TEAL
             st.markdown(f'<div class="ds-eyebrow">{risk_label}</div>', unsafe_allow_html=True)
             render_risk_gauge(risk, risk_color, label=risk_label)
             st.caption(risk_caption)
