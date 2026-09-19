@@ -885,6 +885,38 @@ if source_bytes is not None and run:
             render_risk_gauge(risk, risk_color, label=risk_label)
             st.caption(risk_caption)
 
+            # v8.7: LOW / MEDIUM / HIGH tier, using the model's own DRAPS
+            # thresholds as the boundaries rather than an arbitrary 50/50
+            # split. For the main model this maps exactly onto the
+            # conformal logic already computed above: below q_hat's lower
+            # bound = LOW, the DRAPS-uncertain middle band = MEDIUM, above
+            # the upper bound = HIGH. For the specialist branch (no DRAPS
+            # calibration exists for it), the percentile rank against its
+            # own OOF distribution is used instead, in thirds.
+            if use_specialist:
+                if percentile_rank is None:
+                    tier3, tier3_color = "MEDIUM", AMBER
+                elif percentile_rank >= 66:
+                    tier3, tier3_color = "HIGH", CORAL
+                elif percentile_rank >= 33:
+                    tier3, tier3_color = "MEDIUM", AMBER
+                else:
+                    tier3, tier3_color = "LOW", TEAL
+            else:
+                if deferred:
+                    tier3, tier3_color = "MEDIUM", AMBER
+                elif "malignant" in in_set:
+                    tier3, tier3_color = "HIGH", CORAL
+                else:
+                    tier3, tier3_color = "LOW", TEAL
+            st.markdown(
+                f"""<div style="text-align:center;margin:0.6rem 0 1rem 0;">
+                    <span class="ds-pill" style="background:{tier3_color}22;
+                        color:{tier3_color};font-size:1.05rem;padding:0.5rem 1.4rem;">
+                    ● {tier3} RISK</span></div>""",
+                unsafe_allow_html=True,
+            )
+
             if use_specialist:
                 st.markdown(
                     f"""<div class="ds-card accent" style="--accent:{AMBER};">
