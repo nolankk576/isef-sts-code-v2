@@ -893,8 +893,18 @@ if source_bytes is not None and run:
             # the upper bound = HIGH. For the specialist branch (no DRAPS
             # calibration exists for it), the percentile rank against its
             # own OOF distribution is used instead, in thirds.
+            # v8.7 FIX: use the sensitivity-targeted screening threshold
+            # (Cell 4/4.10) as the primary HIGH-risk trigger instead of the
+            # DRAPS/0.5 boundary alone. Class-imbalance compression means
+            # true positives can calibrate well under 50% even with
+            # balanced training -- sensitivity_threshold_90 is the
+            # properly-derived operating point for "catch real melanomas,"
+            # and is expected to sit well below 0.5.
             if use_specialist:
-                if percentile_rank is None:
+                sens_thr = specialist_bundle.get("sensitivity_threshold_90")
+                if sens_thr is not None and risk >= sens_thr:
+                    tier3, tier3_color = "HIGH", CORAL
+                elif percentile_rank is None:
                     tier3, tier3_color = "MEDIUM", AMBER
                 elif percentile_rank >= 66:
                     tier3, tier3_color = "HIGH", CORAL
@@ -903,7 +913,10 @@ if source_bytes is not None and run:
                 else:
                     tier3, tier3_color = "LOW", TEAL
             else:
-                if deferred:
+                sens_thr = bundle.get("sensitivity_threshold_90")
+                if sens_thr is not None and risk >= sens_thr:
+                    tier3, tier3_color = "HIGH", CORAL
+                elif deferred:
                     tier3, tier3_color = "MEDIUM", AMBER
                 elif "malignant" in in_set:
                     tier3, tier3_color = "HIGH", CORAL
@@ -916,6 +929,12 @@ if source_bytes is not None and run:
                     ● {tier3} RISK</span></div>""",
                 unsafe_allow_html=True,
             )
+            if sens_thr is not None:
+                st.caption(
+                    f"HIGH triggers at risk ≥ {sens_thr:.1%} — a sensitivity-"
+                    f"targeted screening threshold (catches ~90% of true "
+                    f"positives in calibration data), not an arbitrary 50% cutoff."
+                )
 
             if use_specialist:
                 st.markdown(
