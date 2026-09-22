@@ -9,6 +9,25 @@ Two deployment modes, auto-detected by whether model_cache/ is pre-populated:
 NOT a diagnostic device. Research / educational prototype only. Every
 output must be confirmed by a licensed clinician before any care decision.
 
+v9.0 CHANGELOG (train/serve-skew + honesty fixes):
+  1. Feature extraction now comes from dermscript_features.py -- the SAME
+     file the training notebook uses. Backbone weights are always
+     IMAGENET1K_V2 (the deployed app was silently downloading V1).
+  2. No flip-averaging; Shades-of-Gray color correction follows
+     FEATURE_CONFIG; metadata text uses the training template (legacy
+     fusion bundles only). VISION-ONLY bundles skip BERT entirely.
+  3. load_bundle() cache is keyed on the file's mtime, so pushing a new
+     bundle can no longer leave the app serving a stale one.
+  4. Grad-CAM actually uses gradients now (the old code always fell back to
+     a plain activation map). It shows what drives the FEATURE EMBEDDING,
+     not a malignancy heat-map -- the caption says so.
+  5. "CONFIDENT -- BENIGN" is gone. A low score is worded as "below
+     threshold, NOT a rule-out", and a high-novelty input can never be
+     shown as low risk.
+  6. Class-conditional conformal sets calibrated on out-of-fold scores are
+     used when the bundle has them.
+  7. Cloud-demo privacy warning instead of "air-gapped" claim.
+
 v8.7 CHANGELOG vs. the version this replaces:
   1. cp_by_group_ddi key fix: bundle stores per-skin-tone DRAPS thresholds
      under '12'/'34'/'56' (Fitzpatrick type-pair codes), not "FST I-II" etc.
@@ -33,13 +52,17 @@ v8.7 CHANGELOG vs. the version this replaces:
 import io
 import os
 import pickle
+import warnings
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 import cv2
 import numpy as np
 import requests
 import streamlit as st
 from PIL import Image
+
+import dermscript_features as DF
 
 try:
     from referral_note import generate_referral_note
@@ -59,8 +82,18 @@ if _HF_CACHE_POPULATED and _TORCH_CACHE_POPULATED:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-BUNDLE_PATH = APP_DIR / "dermscript_inference_bundle_v8.pkl"
-BUNDLE_ZIP_PATH = APP_DIR / "dermscript_inference_bundle_v8.zip"
+_BUNDLE_NAMES = ["dermscript_inference_bundle_v9", "dermscript_inference_bundle_v8"]
+_chosen_bundle = next(
+    (n for n in _BUNDLE_NAMES
+     if (APP_DIR / f"{n}.pkl").exists() or (APP_DIR / f"{n}.zip").exists()),
+    _BUNDLE_NAMES[-1],
+)
+BUNDLE_PATH = APP_DIR / f"{_chosen_bundle}.pkl"
+BUNDLE_ZIP_PATH = APP_DIR / f"{_chosen_bundle}.zip"
+
+# "offline" only if you really run it air-gapped (set DERMSCRIPT_DEPLOY_MODE=offline).
+DEPLOY_MODE = os.environ.get("DERMSCRIPT_DEPLOY_MODE", "cloud_demo")
+NOVELTY_UNRELIABLE = 2.5   # x the median training-set Mahalanobis distance
 
 RING_BUMP_SPACING_MM = 10.0  # <-- replace with your ring's measured spacing
 MIN_BUMPS_FOR_SCALE = 3
@@ -155,109 +188,107 @@ st.markdown(
 
 
 @st.cache_resource(show_spinner="Loading DermScript model bundle…")
-def load_bundle():
-    with open(BUNDLE_PATH, "rb") as f:
-        return pickle.load(f)
+def load_bundle(mtime_key):
+    """mtime_key is part of the cache key (NOTE: must not start with an
+    underscore, Streamlit ignores such args) so a new bundle on disk always
+    invalidates the cache."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with open(BUNDLE_PATH, "rb") as f:
+            obj = pickle.load(f)
+    msgs = sorted({str(w.message).split("\n")[0] for w in caught
+                   if "version" in str(w.message).lower()})
+    return obj, msgs
 
 
-@st.cache_resource(show_spinner="Loading vision + language backbones (offline)…")
-def load_backbones():
+def render_html(html, height=None, scrolling=False):
+    """st.components.v1.html is deprecated; fall back to st.html if it disappears."""
+    try:
+        import streamlit.components.v1 as components
+        components.html(html, height=height, scrolling=scrolling)
+    except Exception:
+        st.html(html)
+
+
+def compute_novelty(bundle, X):
+    det = bundle.get("novelty_detector")
+    if det is None:
+        return None
+    try:
+        Xp = det["pca_step"].transform(X)
+        raw = det["covariance_model"].mahalanobis(Xp)[0]
+        return float(raw / det["novelty_median"])
+    except Exception:
+        return None
+
+
+TIER_LABEL = {
+    "HIGH": "ABOVE REFERRAL THRESHOLD",
+    "MEDIUM": "UNCERTAIN",
+    "INDETERMINATE": "RESULT NOT RELIABLE",
+    "LOW": "BELOW THRESHOLD — NOT A RULE-OUT",
+}
+
+
+@st.cache_resource(show_spinner="Loading vision backbone…")
+def load_backbones(need_text):
     import torch
-    import torch.nn as nn
-    from torchvision import transforms
-    from torchvision.models import mobilenet_v3_large
-
-    from transformers import AutoTokenizer, AutoModel
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if _TORCH_CACHE_POPULATED:
-        mnet = mobilenet_v3_large(weights=None)
-        state_dict_path = CACHE_DIR / "torch" / "hub" / "checkpoints" / "mobilenet_v3_large-5c1a4163.pth"
-        mnet.load_state_dict(torch.load(state_dict_path, map_location="cpu"))
-    else:
-        from torchvision.models import MobileNet_V3_Large_Weights
-        mnet = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.IMAGENET1K_V1)
-
-    feat_extractor = mnet.features
-    pool = mnet.avgpool
-    mnet.classifier = nn.Identity()
-    mnet.eval().to(device)
-    for p in mnet.parameters():
-        p.requires_grad_(False)
-
-    bert_name = "emilyalsentzer/Bio_ClinicalBERT"
-    tok = AutoTokenizer.from_pretrained(bert_name, local_files_only=_HF_CACHE_POPULATED)
-    bert = AutoModel.from_pretrained(bert_name, local_files_only=_HF_CACHE_POPULATED).eval().to(device)
-    for p in bert.parameters():
-        p.requires_grad_(False)
-
-    img_tf = transforms.Compose(
-        [
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ]
+    mnet = DF.load_vision_model(
+        device, weights="V2",
+        checkpoint_dir=CACHE_DIR / "torch" / "hub" / "checkpoints",
     )
-    return device, mnet, feat_extractor, pool, tok, bert, img_tf
+    tok = bert = None
+    if need_text:   # legacy fusion bundles only; vision-only bundles never load BERT
+        try:
+            tok, bert = DF.load_text_model(device, local_files_only=_HF_CACHE_POPULATED)
+        except Exception:
+            tok, bert = DF.load_text_model(device, local_files_only=False)
+    return SimpleNamespace(
+        device=device, mnet=mnet, feat_extractor=mnet.features, pool=mnet.avgpool,
+        tok=tok, bert=bert, img_tf=DF.make_image_transform(),
+        fingerprint=DF.weights_fingerprint(mnet),
+    )
 
 
-def embed(image, text, device, mnet, tok, bert, img_tf, tta=True):
+def embed(image, text, bb, feature_mode, nlp_dim):
+    """Same pipeline as the notebook: [Shades-of-Gray] -> resize -> normalize ->
+    MobileNetV3 (960-d), no flip averaging.  Text columns are zeros for
+    vision-only bundles."""
     import torch
 
-    if tta:
-        flipped = image.transpose(Image.FLIP_LEFT_RIGHT)
-        imgs = [image, flipped]
-    else:
-        imgs = [image]
-
-    t_orig = img_tf(image).unsqueeze(0).to(device)
-
-    vecs = []
+    x = bb.img_tf(image).unsqueeze(0).to(bb.device)
     with torch.no_grad():
-        for im in imgs:
-            t = img_tf(im).unsqueeze(0).to(device)
-            vecs.append(mnet(t).float().cpu().numpy())
-        v = np.mean(vecs, axis=0)
-
-        enc = tok([text or "Dermoscopy image."], padding=True, truncation=True,
-                  max_length=64, return_tensors="pt").to(device)
-        n = bert(**enc).last_hidden_state[:, 0, :].float().cpu().numpy()
-
-    return np.hstack([v, n]), t_orig
+        v = bb.mnet(x).float().cpu().numpy()
+    if feature_mode == "vision_only" or bb.bert is None:
+        n = np.zeros((1, nlp_dim), dtype=np.float32)
+    else:
+        n = DF.embed_texts([text or DF.FEATURE_CONFIG["placeholder_text"]], bb.tok, bb.bert, bb.device)
+    return np.hstack([v, n]), x
 
 
-def grad_cam(image_tensor, mnet, feat_extractor, pool, device):
+def grad_cam(image_tensor, bb):
+    """Real Grad-CAM on the backbone's last feature map.  Target = norm of the
+    pooled embedding (the downstream PCA+LightGBM is not differentiable), so
+    this shows which regions drive the EMBEDDING, not the malignancy score."""
     import torch
 
-    activations = {}
-
-    def fwd_hook(_, __, out):
-        activations["act"] = out
-
-    handle = feat_extractor[-1].register_forward_hook(fwd_hook)
-
-    image_tensor = image_tensor.clone().requires_grad_(True)
-    feats = feat_extractor(image_tensor)
-    pooled = pool(feats).flatten(1)
-
-    target = pooled.norm()
-    target.backward()
-    handle.remove()
-
-    act = activations["act"].detach()[0]
-    grads = feats.grad if feats.grad is not None else None
-    if grads is None:
-        cam = act.mean(dim=0).cpu().numpy()
-    else:
-        weights = grads[0].mean(dim=(1, 2))
-        cam = torch.relu((weights[:, None, None] * act).sum(0)).cpu().numpy()
-
-    cam -= cam.min()
+    x = image_tensor.detach().clone().requires_grad_(True)
+    with torch.enable_grad():
+        feats = bb.feat_extractor(x)
+        feats.retain_grad()
+        pooled = bb.pool(feats).flatten(1)
+        target = pooled.norm()
+        target.backward()
+    if feats.grad is None:
+        raise RuntimeError("no gradient reached the feature map")
+    weights = feats.grad[0].mean(dim=(1, 2))
+    cam = torch.relu((weights[:, None, None] * feats.detach()[0]).sum(0)).cpu().numpy()
+    cam = cam - cam.min()
     if cam.max() > 0:
-        cam /= cam.max()
-    cam = cv2.resize(cam, (224, 224))
-    return cam
+        cam = cam / cam.max()
+    return cv2.resize(cam.astype(np.float32), (224, 224))
 
 
 def overlay_heatmap(pil_img, cam):
@@ -477,23 +508,26 @@ def render_risk_gauge(risk, color, height=220, label="MALIGNANCY RISK"):
       </svg>
     </div>
     """
-    st.components.v1.html(html, height=height)
+    render_html(html, height=height)
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Header
 # ──────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="ds-eyebrow">EDGE-DEPLOYED · FULLY OFFLINE · RESEARCH PROTOTYPE</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="ds-eyebrow">{"LOCAL / OFFLINE" if DEPLOY_MODE == "offline" else "CLOUD DEMO"} · RESEARCH PROTOTYPE · NOT CLINICALLY VALIDATED</div>',
+    unsafe_allow_html=True,
+)
 st.title("🔬 DermScript")
 st.markdown('<div class="ds-tickrule"></div>', unsafe_allow_html=True)
 st.caption(
-    "Melanoma triage support for use alongside the DermScript dermatoscope. "
-    "This device is validated for dermatoscope images (AUC ~0.87 on the "
-    "genuinely dermatoscopic held-out cohort). For clinical-camera photos, "
-    "a separate specialist model routes in automatically, with reduced "
-    "confidence and a broader 'malignant lesion' label. "
-    "**Not a diagnostic device.** Every output requires confirmation by a "
-    "licensed clinician before any care decision."
+    "Research prototype that scores dermatoscope images for melanoma-like "
+    "appearance. External testing was limited (one small dermatoscopic "
+    "cohort scored well; others scored much lower — see the footer), and it "
+    "has NOT been clinically validated. For clinical-camera photos a separate, "
+    "weaker specialist model may route in, with a broader 'malignant lesion' "
+    "label. **Not a diagnostic device.** A low score is never a rule-out. "
+    "Every output requires confirmation by a licensed clinician."
 )
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -531,6 +565,13 @@ with st.sidebar:
              "Leave as Unknown to use the overall (non-stratified) threshold.",
     )
     fitz = None if fitz_choice == "Unknown" else fitz_choice
+
+    image_type_choice = st.selectbox(
+        "Image type",
+        ["Auto-detect (experimental)", "Dermatoscope image", "Clinical / phone photo"],
+        help="The automatic detector mostly learned to recognise dataset sources and is "
+             "unreliable on new images. If you know how the picture was taken, say so.",
+    )
 
     with st.expander("Clinical observation (optional)"):
         note = st.text_area(
@@ -588,27 +629,35 @@ if not bundle_ok:
                  f"(or a zip of it) next to `app.py`.")
     st.stop()
 
-bundle = load_bundle()
+bundle, bundle_load_warnings = load_bundle(BUNDLE_PATH.stat().st_mtime_ns)
 vis_dim = bundle.get("vis_dim", 960)
 nlp_dim = bundle.get("nlp_dim", 768)
+feature_mode = bundle.get("feature_mode", "fusion")   # "vision_only" for v9 bundles
 specialist_bundle = bundle.get("clinical_camera_specialist")
 
 try:
-    device, mnet, feat_extractor, pool, tok, bert, img_tf = load_backbones()
+    bb = load_backbones(feature_mode != "vision_only")
     backbones_ok = True
 except Exception as e:
     backbones_ok = False
     backbone_error = str(e)
 
-cache_ok = backbones_ok and (CACHE_DIR / "huggingface").exists()
+cache_ok = backbones_ok
 
 status_html = '<div class="ds-status-row">'
 status_html += f'<div class="ds-status {"ok" if bundle_ok else "bad"}">● MODEL BUNDLE LOADED</div>'
-status_html += f'<div class="ds-status {"ok" if cache_ok else "bad"}">● OFFLINE CACHE {"READY" if cache_ok else "FAILED"}</div>'
+status_html += f'<div class="ds-status {"ok" if cache_ok else "bad"}">● BACKBONES {"READY" if cache_ok else "FAILED"}</div>'
 status_html += f'<div class="ds-status {"ok" if specialist_bundle else "warn"}">● CLINICAL-CAMERA SPECIALIST {"LOADED" if specialist_bundle else "NOT IN BUNDLE"}</div>'
-status_html += '<div class="ds-status">● MODE: AIR-GAPPED INFERENCE</div>'
+status_html += f'<div class="ds-status">● FEATURES: {feature_mode.upper()}</div>'
+status_html += f'<div class="ds-status {"ok" if DEPLOY_MODE == "offline" else "warn"}">● MODE: {"OFFLINE" if DEPLOY_MODE == "offline" else "CLOUD DEMO"}</div>'
 status_html += '</div>'
 st.markdown(status_html, unsafe_allow_html=True)
+if DEPLOY_MODE != "offline":
+    st.warning("Cloud demo: uploaded images are sent to a remote server. "
+               "Do not upload real patient images.")
+for _w in bundle_load_warnings:
+    st.warning(f"Model bundle was built with a different library version: {_w} "
+               f"Predictions may be invalid — pin the versions printed by the notebook (see README).")
 
 if not backbones_ok:
     st.error(
@@ -681,19 +730,15 @@ if source_bytes is not None and run:
     pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-    note_parts = []
-    if age is not None:
-        note_parts.append(f"Age {age}")
-    if sex is not None:
-        note_parts.append(sex)
-    if site is not None:
-        note_parts.append(f"site: {site}")
-    context_str = ", ".join(note_parts)
-    full_note = f"{context_str}. {note}".strip(" .") if (context_str or note) else ""
+    # Text for the model = training template only (legacy fusion bundles).
+    # The free-text notes box is NOT embedded; it only goes into the referral note.
+    model_text = DF.canonical_text(age, sex, site)
 
-    with st.spinner("Running multimodal inference…"):
-        X, img_tensor = embed(pil_img, full_note, device, mnet, tok, bert, img_tf)
+    with st.spinner("Running inference…"):
+        X, img_tensor = embed(pil_img, model_text, bb, feature_mode, nlp_dim)
         main_risk = float(bundle["model"].predict_proba(X)[:, 1][0])
+    novelty_score = compute_novelty(bundle, X)
+    input_unreliable = (novelty_score is not None and novelty_score > NOVELTY_UNRELIABLE)
 
     # ── Modality detection decides which model's score is the HEADLINE one.
     modality_det = bundle.get("modality_detector")
@@ -705,7 +750,16 @@ if source_bytes is not None and run:
         except Exception:
             pass
 
-    use_specialist = (p_clinical is not None and p_clinical > 0.5 and specialist_bundle is not None)
+    if image_type_choice.startswith("Dermatoscope"):
+        use_specialist = False
+    elif image_type_choice.startswith("Clinical"):
+        use_specialist = specialist_bundle is not None
+    else:
+        use_specialist = (p_clinical is not None and p_clinical > 0.5 and specialist_bundle is not None)
+    _manual_type = not image_type_choice.startswith("Auto")
+    _clin_src = ("was marked by you as" if image_type_choice.startswith("Clinical")
+                 else (f"scored {p_clinical:.0%} likely to be" if p_clinical is not None else "may be"))
+    _pclin_short = ("user-selected" if _manual_type else (f"{p_clinical:.0%}" if p_clinical is not None else "n/a"))
 
     if use_specialist:
         risk = float(specialist_bundle["model"].predict_proba(X)[:, 1][0])
@@ -724,10 +778,9 @@ if source_bytes is not None and run:
         extra_bits = []
         if percentile_rank is not None:
             extra_bits.append(
-                f"This image scores higher than {percentile_rank:.0f}% of the "
-                f"specialist's own calibration images — a more informative "
-                f"read than the raw percentage above, since that number is "
-                f"compressed by this specialist's very low (1.55%) positive rate."
+                f"Relative rank: this image scores above {percentile_rank:.0f}% of "
+                f"the images the specialist saw in cross-validation (a rank, not "
+                f"a probability; the specialist's positive rate is only ~1.5%)."
             )
         if op_thresh is not None:
             above_below = "ABOVE" if risk >= op_thresh else "below"
@@ -737,19 +790,19 @@ if source_bytes is not None and run:
             )
         extra_caption = (" " + " ".join(extra_bits)) if extra_bits else ""
 
+        _auc_by_src = specialist_bundle.get("oof_auc_by_source", {}) or {}
+        _spec_auc_txt = ", ".join(f"{k} {v:.2f}" for k, v in _auc_by_src.items()) or "n/a"
         risk_caption = (
             "Clinical-camera specialist model score (NOT the dermatoscope "
-            "model). This specialist predicts a BROAD 'malignant lesion' "
-            "outcome, not melanoma specifically — its training data (SCIN) "
-            "labels malignant/pre-malignant conditions generally, not just "
-            "melanoma. Cross-validated AUC on held-out clinical-camera "
-            "images: ~0.66-0.80 depending on source. Treat as a rougher "
-            "signal than the dermatoscope model's score. IMPORTANT: this "
-            "specialist trained on data where only 1.55% of images are "
-            "positive, so its calibrated scores rarely exceed 50% even for "
-            "genuine malignant images — a LOW-looking number here is NOT "
-            "evidence of benign. This branch is always treated as REFER "
-            "regardless of the number shown."
+            "model). It predicts a BROAD 'malignant lesion' outcome, not "
+            "melanoma specifically (its SCIN training labels cover malignant "
+            "and pre-malignant conditions). Cross-validated AUC by source: "
+            f"{_spec_auc_txt}. This is a weak signal: a LOW-looking number is "
+            "NOT evidence of benign, and a HIGH-looking number is not a "
+            "diagnosis. This branch is always treated as REFER."
+            + (" This specialist was trained WITH metadata text, and the text "
+               "placeholder used here may act as a dataset marker — treat the "
+               "score as unvalidated." if feature_mode != "vision_only" else "")
         ) + extra_caption
     else:
         risk = main_risk
@@ -777,11 +830,18 @@ if source_bytes is not None and run:
     # which is what it was calibrated on -- skip it on the specialist branch
     # rather than silently applying a mismatched threshold.
     if not use_specialist:
-        in_set = []
-        if (1 - risk) >= 1 - q_hat:
-            in_set.append("benign")
-        if risk >= 1 - q_hat:
-            in_set.append("malignant")
+        cp_cc = bundle.get("cp_classcond")
+        if cp_cc is not None:
+            # v9: class-conditional conformal calibrated on OUT-OF-FOLD scores
+            in_set = DF.conformal_set(risk, cp_cc)
+            q_hat = cp_cc["q_hat_pos"]
+            group_name = "class-conditional (out-of-fold calibration)"
+        else:
+            in_set = []
+            if (1 - risk) >= 1 - q_hat:
+                in_set.append("benign")
+            if risk >= 1 - q_hat:
+                in_set.append("malignant")
         if not in_set:
             in_set = ["benign", "malignant"]
         deferred = len(in_set) > 1
@@ -832,14 +892,37 @@ if source_bytes is not None and run:
                 st.markdown(f"Specialist operating threshold (Youden's J): `{op_thresh:.4f}` "
                             f"(this score is {'ABOVE' if risk >= op_thresh else 'below'} it)")
 
+        st.markdown(
+            f"Feature mode: `{feature_mode}` · backbone weights fingerprint: "
+            f"`{bb.fingerprint:.6f}` (must equal the value printed in the "
+            f"notebook's Cell 1.2) · Shades-of-Gray: `{DF.FEATURE_CONFIG['shades_of_gray']}` · flip-averaging: `False`"
+        )
+        _bc = bundle.get("feature_config") or {}
+        _diff = [k for k in ("weights", "shades_of_gray", "flip_tta", "image_size")
+                 if k in _bc and _bc[k] != DF.FEATURE_CONFIG.get(k)]
+        if _diff:
+            st.error(f"Feature pipeline differs from the one that built this bundle: {_diff}")
+        _env_b, _env_n = bundle.get("env") or {}, DF.describe_environment()
+        _env_diff = {k: (_env_b.get(k), _env_n.get(k)) for k in ("sklearn", "lightgbm")
+                     if _env_b.get(k) and _env_b.get(k) != _env_n.get(k)}
+        if _env_diff:
+            st.warning(f"Library versions differ from the training run (bundle vs app): {_env_diff}")
+        st.markdown(f"Novelty score: `{novelty_score}` (unreliable above {NOVELTY_UNRELIABLE})")
         st.caption(
             "This panel is here so a mis-keyed or stale bundle shows up immediately "
             "in the UI, instead of only being caught later by an unexpected score."
         )
 
+    if input_unreliable:
+        st.error(
+            f"⚠ This image is {novelty_score:.1f}× more unusual than a typical "
+            f"training image. The score below is NOT reliable — check focus, "
+            f"lighting, framing, and that this is a dermatoscope image, then recapture."
+        )
+
     if use_specialist:
         st.warning(
-            f"📷 This image scored {p_clinical:.0%} likely to be a clinical-camera "
+            f"📷 This image {_clin_src} a clinical-camera "
             f"photo, not a dermatoscope capture. Showing the clinical-camera "
             f"specialist model's score instead of the dermatoscope model's — "
             f"see the debug panel and caption below for what that means."
@@ -880,7 +963,7 @@ if source_bytes is not None and run:
             if use_specialist:
                 risk_color = AMBER
             else:
-                risk_color = CORAL if risk >= 0.5 else TEAL
+                risk_color = CORAL if risk >= 0.5 else (AMBER if input_unreliable else TEAL)
             st.markdown(f'<div class="ds-eyebrow">{risk_label}</div>', unsafe_allow_html=True)
             render_risk_gauge(risk, risk_color, label=risk_label)
             st.caption(risk_caption)
@@ -911,11 +994,14 @@ if source_bytes is not None and run:
                 elif percentile_rank >= 33:
                     tier3, tier3_color = "MEDIUM", AMBER
                 else:
-                    tier3, tier3_color = "LOW", TEAL
+                    # A low specialist score is never shown as low risk.
+                    tier3, tier3_color = "INDETERMINATE", AMBER
             else:
                 sens_thr = bundle.get("sensitivity_threshold_90")
                 if sens_thr is not None and risk >= sens_thr:
                     tier3, tier3_color = "HIGH", CORAL
+                elif input_unreliable:
+                    tier3, tier3_color = "INDETERMINATE", AMBER
                 elif deferred:
                     tier3, tier3_color = "MEDIUM", AMBER
                 elif "malignant" in in_set:
@@ -926,14 +1012,17 @@ if source_bytes is not None and run:
                 f"""<div style="text-align:center;margin:0.6rem 0 1rem 0;">
                     <span class="ds-pill" style="background:{tier3_color}22;
                         color:{tier3_color};font-size:1.05rem;padding:0.5rem 1.4rem;">
-                    ● {tier3} RISK</span></div>""",
+                    ● {TIER_LABEL[tier3]}</span></div>""",
                 unsafe_allow_html=True,
             )
             if sens_thr is not None:
+                _oof_thr = use_specialist or bundle.get("threshold_source") == "oof"
                 st.caption(
-                    f"HIGH triggers at risk ≥ {sens_thr:.1%} — a sensitivity-"
-                    f"targeted screening threshold (catches ~90% of true "
-                    f"positives in calibration data), not an arbitrary 50% cutoff."
+                    f"Referral threshold: risk ≥ {sens_thr:.1%}, chosen to flag ~90% of "
+                    f"melanomas in "
+                    f"{'cross-validated (out-of-fold) training data' if _oof_thr else 'the training data itself (in-sample, optimistic)'}. "
+                    f"On outside cohorts sensitivity was lower (about 75% on PH2). "
+                    f"A score below this threshold is NOT a rule-out."
                 )
 
             if use_specialist:
@@ -955,16 +1044,19 @@ if source_bytes is not None and run:
                 )
             else:
                 label = "MALIGNANT" if "malignant" in in_set else "BENIGN"
-                color = CORAL if label == "MALIGNANT" else TEAL
+                color = CORAL if label == "MALIGNANT" else (AMBER if input_unreliable else TEAL)
+                card_text = ("Conformal set: {malignant} only" if label == "MALIGNANT"
+                             else "Conformal set: {benign} only — score below threshold, not a rule-out")
                 st.markdown(
                     f"""<div class="ds-card accent" style="--accent:{color};">
                         <span class="ds-pill" style="background:{color}22;color:{color};">
-                        ✓ CONFIDENT — {label}</span></div>""",
+                        {card_text}</span></div>""",
                     unsafe_allow_html=True,
                 )
                 st.caption(
-                    f"DRAPS conformal set = {{{in_set[0]}}} at q̂={q_hat:.3f} "
-                    f"for {group_name} — single outcome at the 95% coverage level."
+                    f"Conformal set = {{{in_set[0]}}} ({group_name}). Coverage guarantees "
+                    f"hold only for data resembling the calibration pool; they do not make a "
+                    f"benign call safe, especially for images from other devices or clinics."
                 )
 
             if not use_specialist:
@@ -988,9 +1080,11 @@ if source_bytes is not None and run:
         with xcol1:
             st.markdown("**Grad-CAM — visual attention**")
             try:
-                cam = grad_cam(img_tensor, mnet, feat_extractor, pool, device)
+                cam = grad_cam(img_tensor, bb)
                 st.image(overlay_heatmap(pil_img, cam), use_container_width=True)
-                st.caption("Brighter regions drove more of the model's pooled visual representation.")
+                st.caption("Grad-CAM of the feature extractor: warmer regions push the image "
+                           "EMBEDDING harder. This is not a malignancy heat-map and does not "
+                           "show why the classifier scored the lesion high or low.")
             except Exception as e:
                 st.warning(f"Grad-CAM unavailable this run: {e}")
 
@@ -999,7 +1093,7 @@ if source_bytes is not None and run:
             try:
                 vis_pct, txt_pct, explanation, is_vis = shap_breakdown(active_model, X, vis_dim, nlp_dim)
                 waterfall_svg = render_shap_waterfall(explanation)
-                st.components.v1.html(waterfall_svg, height=520)
+                render_html(waterfall_svg, height=520)
                 st.caption(
                     f"Waterfall for this single lesion (from the "
                     f"{'clinical-camera specialist' if use_specialist else 'dermatoscope'} model): "
@@ -1007,7 +1101,8 @@ if source_bytes is not None and run:
                     f"component pushed the prediction up or down. Roughly "
                     f"{vis_pct*100:.0f}% of total attribution came from vision-dominated "
                     f"components vs. {txt_pct*100:.0f}% from text-dominated ones. This "
-                    f"does NOT identify specific biological biomarkers."
+                    f"does NOT identify specific biological biomarkers. Values are the tree model's raw log-odds "
+                    f"for one of its five calibration folds, so f(x) is not the displayed probability."
                 )
             except Exception as e:
                 st.warning(f"SHAP unavailable this run: {e}")
@@ -1026,7 +1121,16 @@ if source_bytes is not None and run:
             )
 
             modality_warn = None
-            if p_clinical is not None and p_clinical > 0.5:
+            if image_type_choice.startswith("Clinical"):
+                modality_warn = (
+                    "You marked this image as a clinical/phone photo, which the dermatoscope "
+                    "model was not validated for. " +
+                    ("The clinical-camera specialist model's score is shown above (broad "
+                     "'malignant lesion' label, not melanoma-specific)." if use_specialist else
+                     "No specialist model was available — treat the score with substantially "
+                     "reduced confidence.")
+                )
+            elif p_clinical is not None and p_clinical > 0.5 and image_type_choice.startswith("Auto"):
                 modality_warn = (
                     f"This image scored {p_clinical:.0%} likely to be a "
                     f"clinical-camera photo rather than a genuine dermatoscope "
@@ -1039,21 +1143,13 @@ if source_bytes is not None and run:
                      "confidence.")
                 )
 
-            novelty_score = None
-            novelty_det = bundle.get("novelty_detector")
-            if novelty_det is not None:
-                try:
-                    X_pca_for_novelty = novelty_det["pca_step"].transform(X)
-                    raw_maha = novelty_det["covariance_model"].mahalanobis(X_pca_for_novelty)[0]
-                    novelty_score = float(raw_maha / novelty_det["novelty_median"])
-                except Exception:
-                    pass
+            # novelty_score was computed once, right after embedding (compute_novelty).
 
             confidence_reasons = []
             if deferred:
                 confidence_reasons.append("DRAPS conformal set includes both outcomes (model genuinely uncertain)")
             if use_specialist:
-                confidence_reasons.append(f"image likely clinical-camera, routed to specialist model ({p_clinical:.0%})")
+                confidence_reasons.append(f"image likely clinical-camera, routed to specialist model ({_pclin_short})")
             if novelty_score is not None and novelty_score > 2.5:
                 confidence_reasons.append(f"image is {novelty_score:.1f}x more unusual than a typical training image")
 
@@ -1103,7 +1199,7 @@ if source_bytes is not None and run:
             )
             note_obj.model_uncertain = bool(deferred) if not use_specialist else True
 
-            st.components.v1.html(note_obj.to_html(), height=520, scrolling=True)
+            render_html(note_obj.to_html(), height=520, scrolling=True)
 
             dl_col1, dl_col2 = st.columns(2)
             dl_col1.download_button(
@@ -1125,43 +1221,38 @@ elif source_bytes is not None:
     st.caption("Image ready — click **Run DermScript analysis** above to score it.")
 
 # ──────────────────────────────────────────────────────────────────────────
-# Footer — external validation status, corrected to match the current bundle
+# Footer — numbers come from the bundle when it carries them (v9 notebook)
 # ──────────────────────────────────────────────────────────────────────────
+_vs = bundle.get("validation_summary") or {}
+_fallback_note = "" if _vs else " (v8.8 run values — re-run the notebook to refresh)"
+
+
+def _n(key, default, fmt="{:.2f}"):
+    v = _vs.get(key, default)
+    return fmt.format(v) if isinstance(v, (int, float)) else str(v)
+
+
 st.markdown(
     f"""<div class="ds-footer">
-    THE BLOCKER — public benchmarks for AI melanoma detection are almost
-    entirely dermatoscope-only; nothing in this space measures what happens
-    when a patient photographs their own skin with a phone instead. This
-    device quantifies that gap directly: <b>AUC≈0.87 on the genuinely
-    dermatoscopic held-out cohort (PH2) vs. AUC≈0.51-0.55 (near chance) on
-    heterogeneous real-world clinical-camera photos (DDI, MRA-MIDAS) —
-    same model, same patients, different camera.</b><br><br>
-    TRAINING — N=90,953 images, N_pos=7,178 (7.9%), 14 deduplicated cohorts
-    (ISIC 2016-2024, HAM10000, BCN20000, PAD-UFES-20, Derm7pt, MILK10K).
-    In-distribution OOF AUC=0.882.<br><br>
-    EXTERNAL VALIDATION:<br>
-    &nbsp;&nbsp;• PH2 (Porto) — the ONLY genuinely dermatoscopic external
-    cohort: AUC≈0.87<br>
-    &nbsp;&nbsp;• MED-NODE (Groningen) — clinical-camera, but controlled
-    close-up photography: AUC≈0.80<br>
-    &nbsp;&nbsp;• DDI (Stanford), MRA-MIDAS — clinical-camera, heterogeneous
-    real-world photos: AUC≈0.51-0.55, near chance<br>
-    The pattern suggests performance on clinical-camera photos tracks
-    acquisition CONSISTENCY (controlled vs. heterogeneous), not camera type
-    alone — a more nuanced finding than a simple dermatoscope-vs-phone
-    story.<br><br>
-    CLINICAL-CAMERA SPECIALIST — a separate model trained on PAD-UFES-20,
-    DDI, and SCIN routes in automatically for images the modality detector
-    flags as clinical-camera. It predicts a broader "malignant lesion"
-    outcome (not melanoma-specifically) and should be treated as a rougher
-    signal than the dermatoscope model.<br><br>
-    A cohort-identity classifier can distinguish source datasets with ~94%
-    accuracy, indicating the model partly keys off acquisition artifacts —
-    the mechanism behind the gap above, reported honestly as unresolved
-    rather than corrected for.<br><br>
-    NOT a diagnostic device. Generalization beyond dermatoscope-modality
-    images is NOT established. Every output requires confirmation by a
-    licensed clinician before any care decision.
+    WHAT THIS IS — a research prototype that scores a lesion image for melanoma-like
+    appearance. It has not been clinically validated and must not guide care.<br><br>
+    TRAINING — N={_n("n_train", 90953, "{:,}")} images, N_pos={_n("n_pos", 7178, "{:,}")}, pooled from
+    ISIC 2016-2020/2024, HAM10000, BCN20000, PAD-UFES-20, Derm7pt, MILK10K
+    (14 dataset splits from 10 sources). Cross-validated AUC in the pooled data:
+    {_n("oof_auc", 0.879)}{_fallback_note}. This is an optimistic number: the dataset a
+    picture came from can be guessed with ~94% accuracy from the same features, so
+    part of it reflects dataset differences, not lesion biology.<br><br>
+    OUTSIDE COHORTS (AUC){_fallback_note}:<br>
+    &nbsp;&nbsp;• PH2, dermatoscope, N=200 (40 melanoma): {_n("ph2_auc", 0.877)}<br>
+    &nbsp;&nbsp;• MED-NODE, clinical photos, N=170: {_n("mednode_auc", 0.808)}<br>
+    &nbsp;&nbsp;• DDI, clinical photos, N=656 (label = any malignancy): {_n("ddi_auc", 0.553)}<br>
+    &nbsp;&nbsp;• MRA-MIDAS, dermatoscope subset from another hospital: {_n("mra_auc", 0.510)}<br>
+    These cohorts differ in hospital, patients, label definition and size, so they do not
+    isolate the effect of camera type; the small cohorts have wide confidence intervals.<br><br>
+    CLINICAL-CAMERA SPECIALIST — a separate, weaker model (PAD-UFES-20, DDI, SCIN) that
+    predicts a broad "malignant lesion" label, not melanoma specifically.<br><br>
+    NOT a diagnostic device. A low score is not a rule-out. Every output requires
+    confirmation by a licensed clinician before any care decision.
     </div>""",
     unsafe_allow_html=True,
 )
