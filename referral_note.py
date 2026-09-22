@@ -51,7 +51,7 @@ def _risk_tier(risk_score: float) -> str:
     if risk_score >= RISK_HIGH_THRESHOLD:
         return "HIGH"
     elif risk_score <= RISK_LOW_THRESHOLD:
-        return "LOW"
+        return "BELOW THRESHOLD"
     return "MODERATE"
 
 
@@ -106,7 +106,7 @@ class ReferralNote:
     days_since_prior_capture: Optional[int] = None
 
     device_id: str = "DermScript-v1"
-    software_version: str = "v8.7"
+    software_version: str = "v9.0"
 
     def recommended_action(self) -> str:
         """Plain-language line for the top of the note — this is the one
@@ -134,7 +134,9 @@ class ReferralNote:
             return f"REFER FOR PROMPT DERMATOLOGIST EVALUATION.{urgent}"
         if self.risk_tier == "MODERATE":
             return "CONSIDER DERMATOLOGIST EVALUATION — routine timeframe reasonable absent other concerning signs."
-        return "LOW MODEL-ESTIMATED RISK — routine monitoring; re-screen if lesion changes (size, color, symptoms)."
+        return ("BELOW THE MODEL'S REFERRAL THRESHOLD — this is NOT a rule-out. Any lesion that is "
+                "changing, symptomatic, or concerning to the patient or clinician should still be "
+                "evaluated by a clinician.")
 
     def to_text(self) -> str:
         lines = []
@@ -209,7 +211,7 @@ class ReferralNote:
 
     def to_html(self) -> str:
         """Lightweight HTML for embedding in the Streamlit app or printing."""
-        tier_color = {"HIGH": "#ff6b81", "MODERATE": "#e8a33d", "LOW": "#3fd6a8"}.get(self.risk_tier, "#7c828e")
+        tier_color = {"HIGH": "#ff6b81", "MODERATE": "#e8a33d", "BELOW THRESHOLD": "#e8a33d"}.get(self.risk_tier, "#7c828e")
         rows = [
             ("Age", self.patient_age), ("Sex", self.patient_sex),
             ("Anatomical site", self.anatomical_site),
