@@ -223,10 +223,10 @@ def compute_novelty(bundle, X):
 
 
 TIER_LABEL = {
-    "HIGH": "ABOVE REFERRAL THRESHOLD",
-    "MEDIUM": "UNCERTAIN",
+    "HIGH": "HIGH — ABOVE REFERRAL THRESHOLD",
+    "MEDIUM": "MEDIUM — UNCERTAIN",
     "INDETERMINATE": "RESULT NOT RELIABLE",
-    "LOW": "BELOW THRESHOLD — NOT A RULE-OUT",
+    "LOW": "LOW — NOT A RULE-OUT",
 }
 
 
@@ -458,6 +458,27 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     if not dists:
         return None, debug
 
+    # v9.2: a real ruler's bumps are COLLINEAR and EVENLY spaced along that line.
+    # Raw all-pairwise distances are the wrong statistic to test that with --
+    # 4 evenly-spaced collinear points naturally have unequal pairwise distances
+    # (e.g. spacings of 10/20/30mm between different pairs), so a variance check
+    # on all-pairwise distances rejects good rulers too. Instead: fit the
+    # principal axis, check the points sit close to that line (collinear), then
+    # check CONSECUTIVE gaps along it are consistent (evenly spaced).
+    pts_c = pts - pts.mean(axis=0)
+    _, _, vt = np.linalg.svd(pts_c)
+    major, minor = vt[0], vt[1]
+    along = pts_c @ major
+    perp = pts_c @ minor
+    collinear_ok = (np.abs(perp).max() < 0.4 * (along.max() - along.min() + 1e-6))
+    order = np.argsort(along)
+    gaps = np.diff(along[order])
+    evenly_spaced_ok = (len(gaps) == 0) or (gaps.std() / (gaps.mean() + 1e-6) < 0.35)
+    if not (collinear_ok and evenly_spaced_ok):
+        cv2.putText(debug, "Ruler bumps not detected", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        return None, debug
+
     px_per_mm = float(np.mean(dists)) / RING_BUMP_SPACING_MM
     if px_per_mm <= 0:
         return None, debug
@@ -474,6 +495,13 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     cv2.circle(debug, (int(cx), int(cy)), int(radius_px), (255, 0, 255), 2)
 
     diameter_mm = (2 * radius_px) / px_per_mm
+    # v9.2: sanity backstop. Melanomas presenting for screening are essentially
+    # never this large or this small; treat an out-of-range result as a failed
+    # calibration rather than display it with false confidence.
+    if not (1.0 <= diameter_mm <= 30.0):
+        cv2.putText(debug, "Diameter estimate out of plausible range", (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        return None, debug
     return diameter_mm, debug
 
 
