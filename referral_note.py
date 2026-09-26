@@ -48,6 +48,16 @@ UNCERTAINTY_THRESHOLD = 0.35
 
 
 def _risk_tier(risk_score: float) -> str:
+    # v9.3 FIX: these were hardcoded placeholders (0.6/0.3) left over from an
+    # early LED-hardware draft and were NEVER wired to the model's real
+    # out-of-fold referral threshold used everywhere else in the app. That
+    # made this function silently disagree with the Risk & Sizing tab on
+    # every single capture -- e.g. 29.9% showed "HIGH" there and "BELOW
+    # THRESHOLD" here, because 29.9% is below the placeholder 0.3 cutoff
+    # even though it is nearly 5x the real 6.6% referral threshold.
+    # generate_referral_note() below now ALWAYS passes an explicit
+    # risk_tier computed from the live bundle threshold; this function is
+    # kept only as a same-file fallback if that ever isn't supplied.
     if risk_score >= RISK_HIGH_THRESHOLD:
         return "HIGH"
     elif risk_score <= RISK_LOW_THRESHOLD:
@@ -281,17 +291,24 @@ def generate_referral_note(
     recapture_hint: Optional[str] = None,
     lesion_comparison: Optional["LesionComparisonResult"] = None,
     days_since_prior_capture: Optional[int] = None,
+    risk_tier: Optional[str] = None,
 ) -> ReferralNote:
     """Single entry point — call this right after your model produces a
     prediction, same moment you'd call led_feedback.show_result(). Pass a
     LesionComparisonResult from lesion_tracker.compare_lesion_captures()
-    directly if a prior capture of this lesion exists; omit it otherwise."""
+    directly if a prior capture of this lesion exists; omit it otherwise.
+
+    risk_tier: v9.3 -- pass the SAME tier the rest of the app already
+    computed from the bundle's real out-of-fold threshold (e.g. "HIGH",
+    "MODERATE"/"BELOW THRESHOLD"), so this note can't silently disagree
+    with the Risk & Sizing tab. If omitted, falls back to the placeholder
+    0.6/0.3 cutoffs in _risk_tier() -- only correct by coincidence."""
 
     note = ReferralNote(
         patient_age=patient_age, patient_sex=patient_sex,
         anatomical_site=anatomical_site, fitzpatrick_skin_type=fitzpatrick_skin_type,
         clinical_notes=clinical_notes,
-        risk_score=risk_score, risk_tier=_risk_tier(risk_score),
+        risk_score=risk_score, risk_tier=(risk_tier if risk_tier is not None else _risk_tier(risk_score)),
         draps_interval_width=draps_interval_width,
         novelty_score=novelty_score, confidence_tier=confidence_tier,
         recapture_hint=recapture_hint,
