@@ -223,11 +223,11 @@ def compute_novelty(bundle, X):
 
 
 TIER_LABEL = {
-    "HIGH": "HIGH — ABOVE REFERRAL THRESHOLD",
-    "MEDIUM": "MEDIUM — UNCERTAIN",
-    "INDETERMINATE": "RESULT NOT RELIABLE",
-    "LOW": "LOW — NOT A RULE-OUT",
+    "HIGH": "HIGH RISK",
+    "MEDIUM": "MEDIUM RISK",
+    "LOW": "LOW RISK",
 }
+TIER_COLOR_NAME = {"HIGH": "RED", "MEDIUM": "YELLOW", "LOW": "GREEN"}
 
 
 @st.cache_resource(show_spinner="Loading vision backbone…")
@@ -978,69 +978,65 @@ if source_bytes is not None and run:
                 )
 
         with col2:
-            # FIX: the specialist model's positive rate in training is only
-            # 1.55% (609/39,301) -- calibrated probabilities from a model
-            # this imbalanced almost never exceed 50% even for genuine
-            # malignant images (same compression effect documented for the
-            # main model in the footer, worse here due to the lower base
-            # rate). The backend ALREADY treats every specialist-routed
-            # prediction as REFER-tier regardless of the number -- showing
-            # a green "LOW" pill next to that same score contradicted the
-            # REFER banner. Specialist branch now always renders amber,
-            # never green, matching what the REFER tier is already saying.
-            if use_specialist:
-                risk_color = AMBER
-            else:
-                risk_color = CORAL if risk >= 0.5 else (AMBER if input_unreliable else TEAL)
             st.markdown(f'<div class="ds-eyebrow">{risk_label}</div>', unsafe_allow_html=True)
-            render_risk_gauge(risk, risk_color, label=risk_label)
-            st.caption(risk_caption)
 
-            # v8.7: LOW / MEDIUM / HIGH tier, using the model's own DRAPS
-            # thresholds as the boundaries rather than an arbitrary 50/50
-            # split. For the main model this maps exactly onto the
-            # conformal logic already computed above: below q_hat's lower
-            # bound = LOW, the DRAPS-uncertain middle band = MEDIUM, above
-            # the upper bound = HIGH. For the specialist branch (no DRAPS
-            # calibration exists for it), the percentile rank against its
-            # own OOF distribution is used instead, in thirds.
-            # v8.7 FIX: use the sensitivity-targeted screening threshold
-            # (Cell 4/4.10) as the primary HIGH-risk trigger instead of the
-            # DRAPS/0.5 boundary alone. Class-imbalance compression means
-            # true positives can calibrate well under 50% even with
-            # balanced training -- sensitivity_threshold_90 is the
-            # properly-derived operating point for "catch real melanomas,"
-            # and is expected to sit well below 0.5.
+            # v10.0: ONE simplified 3-tier system (LOW/MEDIUM/HIGH, green/
+            # yellow/red) used for the gauge color AND the pill AND the
+            # referral note, so nothing can disagree with anything else.
+            # The cut points are NOT equal thirds of the raw 0-100% score --
+            # a literal equal-thirds split would put real melanomas in the
+            # green zone (the specialist model rarely exceeds 40% even for
+            # genuine positives; the main model's real referral threshold is
+            # 6.6%, not 33%). Instead the three tiers are "thirds of
+            # statistical confidence": conformal set = {benign} only -> LOW;
+            # {malignant} only -> HIGH; anything uncertain, unreliable
+            # (high novelty), or specialist-routed (weak signal, never
+            # shown as LOW) -> MEDIUM.
             if use_specialist:
                 sens_thr = specialist_bundle.get("sensitivity_threshold_90")
-                if sens_thr is not None and risk >= sens_thr:
-                    tier3, tier3_color = "HIGH", CORAL
-                elif percentile_rank is None:
-                    tier3, tier3_color = "MEDIUM", AMBER
-                elif percentile_rank >= 66:
-                    tier3, tier3_color = "HIGH", CORAL
-                elif percentile_rank >= 33:
-                    tier3, tier3_color = "MEDIUM", AMBER
-                else:
-                    # A low specialist score is never shown as low risk.
-                    tier3, tier3_color = "INDETERMINATE", AMBER
+                op_thr_j = specialist_bundle.get("operating_threshold_youden")
+                _hi = (sens_thr is not None and risk >= sens_thr) or \
+                      (op_thr_j is not None and risk >= op_thr_j) or \
+                      (percentile_rank is not None and percentile_rank >= 66)
+                tier3 = "HIGH" if _hi else "MEDIUM"  # never LOW -- see note above
             else:
                 sens_thr = bundle.get("sensitivity_threshold_90")
-                if sens_thr is not None and risk >= sens_thr:
-                    tier3, tier3_color = "HIGH", CORAL
-                elif input_unreliable:
-                    tier3, tier3_color = "INDETERMINATE", AMBER
-                elif deferred:
-                    tier3, tier3_color = "MEDIUM", AMBER
-                elif "malignant" in in_set:
-                    tier3, tier3_color = "HIGH", CORAL
+                if input_unreliable:
+                    tier3 = "MEDIUM"  # can't trust the score either way -- never LOW, never HIGH
+                elif in_set == ["malignant"]:
+                    tier3 = "HIGH"
+                elif in_set == ["benign"]:
+                    tier3 = "LOW"
+                elif sens_thr is not None and risk >= sens_thr:
+                    tier3 = "HIGH"
                 else:
-                    tier3, tier3_color = "LOW", TEAL
+                    tier3 = "MEDIUM"
+            tier3_color = {"HIGH": CORAL, "MEDIUM": AMBER, "LOW": TEAL}[tier3]
+            risk_color = tier3_color  # gauge always matches the pill now
+
+            render_risk_gauge(risk, risk_color, label=risk_label)
+            if use_specialist and percentile_rank is not None:
+                # v9.4: this model's raw score is severely compressed by class
+                # imbalance (~98.5% negative in training) -- a genuine positive
+                # rarely tops 50%, so the raw percentage alone reads as "low"
+                # when it may be the most suspicious score this model has ever
+                # produced. Surface the percentile right next to the number
+                # itself, not three paragraphs into the caption below it.
+                st.markdown(
+                    f'<div style="text-align:center;color:{AMBER};font-weight:600;">'
+                    f'Higher than {percentile_rank:.1f}% of this model\'s calibration images '
+                    f'(read this, not the raw %)</div>',
+                    unsafe_allow_html=True,
+                )
+            st.caption(risk_caption)
+
             st.markdown(
-                f"""<div style="text-align:center;margin:0.6rem 0 1rem 0;">
+                f"""<div style="text-align:center;margin:0.6rem 0 0.2rem 0;">
                     <span class="ds-pill" style="background:{tier3_color}22;
                         color:{tier3_color};font-size:1.05rem;padding:0.5rem 1.4rem;">
-                    ● {TIER_LABEL[tier3]}</span></div>""",
+                    ● {TIER_LABEL[tier3]}</span></div>
+                <div style="text-align:center;color:{MUTED};font-size:0.85rem;margin-bottom:1rem;">
+                    model output: {risk:.1%}</div>""",
                 unsafe_allow_html=True,
             )
             if sens_thr is not None:
@@ -1224,6 +1220,11 @@ if source_bytes is not None and run:
                 novelty_score=novelty_score,
                 confidence_tier=confidence_tier,
                 recapture_hint=recapture_hint,
+                # v10.0: tier3 is now always exactly "HIGH"/"MEDIUM"/"LOW"
+                # (see the single 3-tier block above) -- map straight across
+                # to the note's own vocabulary so this can't drift again.
+                risk_tier={"HIGH": "HIGH", "MEDIUM": "MODERATE",
+                           "LOW": "BELOW THRESHOLD"}.get(tier3),
             )
             note_obj.model_uncertain = bool(deferred) if not use_specialist else True
 
