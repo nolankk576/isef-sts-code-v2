@@ -505,49 +505,64 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     return diameter_mm, debug
 
 
-def render_risk_gauge(risk, color, height=220, label="MALIGNANCY RISK",
-                       tier=None, tier_word=None):
+def render_risk_gauge(risk, color, height=240, label="MALIGNANCY RISK",
+                       tier="MEDIUM", confidence_pct=None, confidence_label="Score"):
     import math
 
     r = 80
     cx, cy = 100, 100
 
-    # v10.1 — FIX: the arc fill and the big central number now track the
-    # TIER (LOW/MEDIUM/HIGH), not the raw model probability. Previously both
-    # were driven by `risk` directly, so a HIGH/red result from the
-    # clinical-camera specialist (whose genuine positives rarely score above
-    # ~40-50% -- see the comment where tier3 is computed) rendered as a red
-    # gauge that was less than half full, showing "40.1%" in giant text right
-    # next to a "HIGH RISK" pill. That combination read as self-contradictory
-    # even though the tier assignment itself was correct. Fixed-fraction
-    # fills per tier make the gauge agree with the pill on sight; the exact
-    # percentage is still shown in the caption underneath for anyone who
-    # wants the raw number.
-    tier_fill = {"LOW": 0.16, "MEDIUM": 0.55, "HIGH": 0.92}.get(tier, risk)
-    end_angle = math.pi * (1 - tier_fill)
-    x2 = cx + r * math.cos(end_angle)
-    y2 = cy - r * math.sin(end_angle)
-    large_arc = 1 if tier_fill > 0.5 else 0
+    # v10.2 -- FIX (round 2). v10.1's fixed-fraction fill (LOW=16%, MEDIUM=
+    # 55%, HIGH=92% of the arc) still looked like it was measuring a
+    # magnitude, so a HIGH result whose raw score was 40% still looked
+    # "wrong" next to a bar that was 92% full. Replaced with a plain
+    # 3-segment traffic light: LOW / MEDIUM / HIGH are always the same
+    # three equal-sized arcs in the same three fixed colors; the ONLY thing
+    # that changes is which one is lit at full opacity/thickness. It no
+    # longer implies a continuous quantity at all, so it can't visually
+    # disagree with a percentage shown next to it. The raw model score (or,
+    # for the specialist branch, the percentile rank -- a more honest number
+    # given that model's compressed output range) is shown as a small,
+    # clearly separate line below, never overlapping the tier visually.
+    segs = [
+        ("LOW", TEAL, math.pi, math.pi * 2 / 3),
+        ("MEDIUM", AMBER, math.pi * 2 / 3, math.pi * 1 / 3),
+        ("HIGH", CORAL, math.pi * 1 / 3, 0.0),
+    ]
 
-    center_text = tier_word if tier_word else f"{risk*100:.1f}%"
-    center_font_size = 24 if tier_word else 30
+    def pt(angle):
+        return (cx + r * math.cos(angle), cy - r * math.sin(angle))
+
+    arcs_svg = []
+    for name, seg_color, a0, a1 in segs:
+        x0, y0 = pt(a0)
+        x1, y1 = pt(a1)
+        active = (name == tier)
+        arcs_svg.append(
+            f'<path d="M {x0:.3f} {y0:.3f} A {r} {r} 0 0 1 {x1:.3f} {y1:.3f}" '
+            f'stroke="{seg_color}" stroke-width="{14 if active else 9}" fill="none" '
+            f'stroke-linecap="round" opacity="{1.0 if active else 0.28}"/>'
+        )
+    arcs_html = "\n".join(arcs_svg)
+
+    if confidence_pct is None:
+        confidence_pct = risk * 100
+    conf_svg = (
+        f'<text x="{cx}" y="{cy + 32}" font-family="JetBrains Mono, monospace" '
+        f'font-size="11" text-anchor="middle" fill="#a8adb8">'
+        f'{confidence_label}: {confidence_pct:.1f}%</text>'
+    )
 
     html = f"""
     <div style="display:flex;justify-content:center;">
-      <svg viewBox="0 0 200 120" width="260" height="{height}">
-        <path d="M 20 100 A {r} {r} 0 0 1 180 100" stroke="#23262e"
-              stroke-width="10" fill="none" stroke-linecap="round"/>
-        <path d="M 20 100 A {r} {r} 0 {large_arc} 1 {x2:.4f} {y2:.4f}"
-              stroke="{color}" stroke-width="10" fill="none"
-              stroke-linecap="round"/>
-        <circle cx="{cx}" cy="{cy}" r="50" fill="#0D1117" stroke="#1E2533" stroke-width="1"/>
-        <text x="{cx}" y="{cy - 8}" font-family="JetBrains Mono, monospace" font-size="{center_font_size}"
-              font-weight="700" text-anchor="middle" fill="{color}">{center_text}</text>
-        <text x="{cx}" y="{cy + 16}" font-family="Inter, sans-serif" font-size="9"
+      <svg viewBox="0 0 200 140" width="260" height="{height}">
+        {arcs_html}
+        <circle cx="{cx}" cy="{cy}" r="48" fill="#0D1117" stroke="#1E2533" stroke-width="1"/>
+        <text x="{cx}" y="{cy - 6}" font-family="JetBrains Mono, monospace" font-size="26"
+              font-weight="700" text-anchor="middle" fill="{color}">{tier}</text>
+        <text x="{cx}" y="{cy + 14}" font-family="Inter, sans-serif" font-size="9"
               text-anchor="middle" fill="#7c828e">{label}</text>
-        <line x1="20" y1="100" x2="10" y2="100" stroke="#7D8FAB" stroke-width="1" opacity="0.5"/>
-        <line x1="100" y1="20" x2="100" y2="10" stroke="#7D8FAB" stroke-width="1" opacity="0.5"/>
-        <line x1="180" y1="100" x2="190" y2="100" stroke="#7D8FAB" stroke-width="1" opacity="0.5"/>
+        {conf_svg}
       </svg>
     </div>
     """
@@ -1029,8 +1044,12 @@ if source_bytes is not None and run:
             tier3_color = {"HIGH": CORAL, "MEDIUM": AMBER, "LOW": TEAL}[tier3]
             risk_color = tier3_color  # gauge always matches the pill now
 
-            render_risk_gauge(risk, risk_color, label=risk_label,
-                               tier=tier3, tier_word=TIER_COLOR_NAME[tier3])
+            render_risk_gauge(
+                risk, risk_color, label=risk_label, tier=tier3,
+                confidence_pct=(percentile_rank if use_specialist and percentile_rank is not None
+                                 else risk * 100),
+                confidence_label=("Percentile" if use_specialist else "Score"),
+            )
             if use_specialist and percentile_rank is not None:
                 # v9.4: this model's raw score is severely compressed by class
                 # imbalance (~98.5% negative in training) -- a genuine positive
