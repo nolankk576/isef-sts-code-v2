@@ -505,17 +505,32 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
     return diameter_mm, debug
 
 
-def render_risk_gauge(risk, color, height=220, label="MALIGNANCY RISK"):
+def render_risk_gauge(risk, color, height=220, label="MALIGNANCY RISK",
+                       tier=None, tier_word=None):
     import math
 
     r = 80
     cx, cy = 100, 100
 
-    start_angle = math.pi
-    end_angle = math.pi * (1 - risk)
+    # v10.1 — FIX: the arc fill and the big central number now track the
+    # TIER (LOW/MEDIUM/HIGH), not the raw model probability. Previously both
+    # were driven by `risk` directly, so a HIGH/red result from the
+    # clinical-camera specialist (whose genuine positives rarely score above
+    # ~40-50% -- see the comment where tier3 is computed) rendered as a red
+    # gauge that was less than half full, showing "40.1%" in giant text right
+    # next to a "HIGH RISK" pill. That combination read as self-contradictory
+    # even though the tier assignment itself was correct. Fixed-fraction
+    # fills per tier make the gauge agree with the pill on sight; the exact
+    # percentage is still shown in the caption underneath for anyone who
+    # wants the raw number.
+    tier_fill = {"LOW": 0.16, "MEDIUM": 0.55, "HIGH": 0.92}.get(tier, risk)
+    end_angle = math.pi * (1 - tier_fill)
     x2 = cx + r * math.cos(end_angle)
     y2 = cy - r * math.sin(end_angle)
-    large_arc = 1 if risk > 0.5 else 0
+    large_arc = 1 if tier_fill > 0.5 else 0
+
+    center_text = tier_word if tier_word else f"{risk*100:.1f}%"
+    center_font_size = 24 if tier_word else 30
 
     html = f"""
     <div style="display:flex;justify-content:center;">
@@ -526,8 +541,8 @@ def render_risk_gauge(risk, color, height=220, label="MALIGNANCY RISK"):
               stroke="{color}" stroke-width="10" fill="none"
               stroke-linecap="round"/>
         <circle cx="{cx}" cy="{cy}" r="50" fill="#0D1117" stroke="#1E2533" stroke-width="1"/>
-        <text x="{cx}" y="{cy - 8}" font-family="JetBrains Mono, monospace" font-size="30"
-              font-weight="700" text-anchor="middle" fill="{color}">{risk*100:.1f}%</text>
+        <text x="{cx}" y="{cy - 8}" font-family="JetBrains Mono, monospace" font-size="{center_font_size}"
+              font-weight="700" text-anchor="middle" fill="{color}">{center_text}</text>
         <text x="{cx}" y="{cy + 16}" font-family="Inter, sans-serif" font-size="9"
               text-anchor="middle" fill="#7c828e">{label}</text>
         <line x1="20" y1="100" x2="10" y2="100" stroke="#7D8FAB" stroke-width="1" opacity="0.5"/>
@@ -1014,7 +1029,8 @@ if source_bytes is not None and run:
             tier3_color = {"HIGH": CORAL, "MEDIUM": AMBER, "LOW": TEAL}[tier3]
             risk_color = tier3_color  # gauge always matches the pill now
 
-            render_risk_gauge(risk, risk_color, label=risk_label)
+            render_risk_gauge(risk, risk_color, label=risk_label,
+                               tier=tier3, tier_word=TIER_COLOR_NAME[tier3])
             if use_specialist and percentile_rank is not None:
                 # v9.4: this model's raw score is severely compressed by class
                 # imbalance (~98.5% negative in training) -- a genuine positive
