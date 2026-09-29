@@ -32,6 +32,15 @@ USAGE
     # just prints what the app would show for each one, no AUC/sensitivity.
     python batch_sanity_check.py --dataset adhoc --folder /path/to/images/
 
+    # KEY DIAGNOSTIC: does routing MED-NODE to the specialist (what the live
+    # app does) actually score worse than just using the main model directly
+    # (what Cell 5's reported MED-NODE AUC=0.84 actually measured -- Cell 5
+    # calls cal_clf, i.e. the main model, NOT the specialist)? Run all three
+    # and compare the AUCs the script prints:
+    python batch_sanity_check.py --dataset mednode --zip complete_mednode_dataset.zip --branch auto
+    python batch_sanity_check.py --dataset mednode --zip complete_mednode_dataset.zip --branch main
+    python batch_sanity_check.py --dataset mednode --zip complete_mednode_dataset.zip --branch specialist
+
     # Any folder of images WITH known labels via a CSV (columns: filename,label
     # where label is 0=benign/1=malignant)
     python batch_sanity_check.py --dataset labeled_folder --folder /path/to/images/ --labels_csv labels.csv
@@ -207,11 +216,37 @@ def load_adhoc_folder(folder: Path, labels_csv: Path | None):
 # ---------------------------------------------------------------------------
 # Core: exactly what streamlit_app.py does per-image, minus the UI
 # ---------------------------------------------------------------------------
-def run_one(image, bundle, bb, vis_dim, nlp_dim, feature_mode):
+def run_one(image, bundle, bb, vis_dim, nlp_dim, feature_mode, branch="auto"):
     model_text = DF.FEATURE_CONFIG["placeholder_text"]  # same default the app uses with no patient fields
     X, _ = embed(image, model_text, bb, feature_mode, nlp_dim)
 
-    main_risk = float(bundle["model"].predict_proba(X)[:, 1][0])
+    p_clinical = None
+    modality_det = bundle.get("modality_detector")
+    if modality_det is not None:
+        try:
+            X_pca = modality_det["pca_step"].transform(X)
+            p_clinical = float(modality_det["model"].predict_proba(X_pca)[:, 1][0])
+        except Exception:
+            pass
+
+    # branch="auto" reproduces the app's real routing (modality_detector decides).
+    # branch="main"/"specialist" FORCE that model regardless of modality_detector,
+    # so you can directly compare -- e.g. does the notebook's cal_clf (Cell 5's
+    # MED-NODE AUC=0.84, main model, routing bypassed) actually beat the
+    # clinical-camera specialist (which was never validated on MED-NODE at all --
+    # Cell 4.10's per-source breakdown only covers DDI/PAD-UFES-20/SCIN) on the
+    # SAME images the live app would route to the specialist?
+    use_specialist = (branch == "specialist") or (
+        branch == "auto" and p_clinical is not None and p_clinical > 0.5
+    )
+
+    specialist_bundle = bundle.get("clinical_camera_specialist")
+    if use_specialist and specialist_bundle is not None:
+        risk = float(specialist_bundle["model"].predict_proba(X)[:, 1][0])
+        model_used = "specialist"
+    else:
+        risk = float(bundle["model"].predict_proba(X)[:, 1][0])
+        model_used = "main"
 
     novelty_score = None
     det = bundle.get("novelty_detector")
@@ -223,16 +258,6 @@ def run_one(image, bundle, bb, vis_dim, nlp_dim, feature_mode):
         except Exception:
             pass
 
-    p_clinical = None
-    modality_det = bundle.get("modality_detector")
-    if modality_det is not None:
-        try:
-            X_pca = modality_det["pca_step"].transform(X)
-            p_clinical = float(modality_det["model"].predict_proba(X_pca)[:, 1][0])
-        except Exception:
-            pass
-
-    risk = main_risk
     cp_cc = bundle.get("cp_classcond")
     if cp_cc is not None:
         in_set = DF.conformal_set(risk, cp_cc)
@@ -263,9 +288,10 @@ def run_one(image, bundle, bb, vis_dim, nlp_dim, feature_mode):
     return {
         "predicted_prob": risk,
         "tier": tier,
+        "model_used": model_used,
+        "p_clinical": p_clinical,
         "conformal_set": "+".join(in_set),
         "novelty_score": novelty_score,
-        "p_clinical": p_clinical,
         "sensitivity_threshold_90": sens_thr,
     }
 
@@ -309,10 +335,17 @@ def main():
                      help="for labeled_folder: CSV with columns filename,label")
     ap.add_argument("--bundle", type=Path,
                      default=Path("dermscript_inference_bundle_v9.pkl"))
+    ap.add_argument("--branch", choices=["auto", "main", "specialist"], default="auto",
+                     help="auto=app's real routing (modality_detector decides). "
+                          "main/specialist=FORCE that model on every image, to compare "
+                          "e.g. whether the specialist genuinely underperforms the main "
+                          "model on a cohort like MED-NODE that the specialist was never "
+                          "validated on (see script docstring).")
     ap.add_argument("--out_prefix", default=None)
     args = ap.parse_args()
 
-    out_prefix = args.out_prefix or args.dataset
+    out_prefix = (args.out_prefix or args.dataset) + (
+        f"_{args.branch}" if args.branch != "auto" else "")
 
     print(f"Loading bundle: {args.bundle}")
     bundle = load_bundle(args.bundle)
@@ -336,7 +369,7 @@ def main():
     rows = []
     flagged = []
     for i, (name, img, true_label) in enumerate(items):
-        r = run_one(img, bundle, bb, vis_dim, nlp_dim, feature_mode)
+        r = run_one(img, bundle, bb, vis_dim, nlp_dim, feature_mode, branch=args.branch)
         r["filename"] = name
         r["true_label"] = true_label
         rows.append(r)
@@ -362,8 +395,8 @@ def main():
     pred_path = f"{out_prefix}_predictions.csv"
     with open(pred_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["filename", "true_label", "predicted_prob", "tier",
-                                           "conformal_set", "novelty_score", "p_clinical",
-                                           "flagged_reason"])
+                                           "model_used", "conformal_set", "novelty_score",
+                                           "p_clinical", "flagged_reason"])
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k) for k in w.fieldnames})
