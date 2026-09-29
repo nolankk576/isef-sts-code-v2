@@ -5,8 +5,8 @@ streamlit==1.64.0
 torch==2.14.0
 torchvision==0.29.0
 transformers==5.17.0
-scikit-learn==1.9.1
-lightgbm==4.7.0
+scikit-learn==1.6.1
+lightgbm==4.6.0
 shap==0.52.0
 opencv-python-headless==5.0.0.93
 numpy==2.5.2
