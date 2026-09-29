@@ -1025,9 +1025,21 @@ if source_bytes is not None and run:
             if use_specialist:
                 sens_thr = specialist_bundle.get("sensitivity_threshold_90")
                 op_thr_j = specialist_bundle.get("operating_threshold_youden")
-                _hi = (sens_thr is not None and risk >= sens_thr) or \
-                      (op_thr_j is not None and risk >= op_thr_j) or \
-                      (percentile_rank is not None and percentile_rank >= 66)
+                # v10.3 -- FIX: this used to OR three thresholds together,
+                # including sens_thr (~0.22%, tuned for 90% sensitivity on a
+                # ~1.5%-positive-rate training set -- deliberately so low that
+                # almost ANY nonzero signal crosses it) and percentile_rank>=66
+                # (top third of a heavily right-compressed distribution, also
+                # easy to cross). Combined, that meant a single weak signal
+                # from any one of three lenient criteria was enough for HIGH,
+                # which is why nearly every MED-NODE naevus (benign) photo was
+                # landing on HIGH once routed to the specialist. Using ONLY
+                # the Youden's J operating point -- the model's own
+                # sensitivity/specificity-BALANCED threshold, ~82.5%
+                # specificity per the notebook's own DDI evaluation -- is a
+                # deliberately stricter bar for "the specialist itself thinks
+                # this is concerning," not just "not exactly zero."
+                _hi = (op_thr_j is not None and risk >= op_thr_j)
                 tier3 = "HIGH" if _hi else "MEDIUM"  # never LOW -- see note above
             else:
                 sens_thr = bundle.get("sensitivity_threshold_90")
