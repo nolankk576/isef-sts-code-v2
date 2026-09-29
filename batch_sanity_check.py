@@ -258,39 +258,56 @@ def run_one(image, bundle, bb, vis_dim, nlp_dim, feature_mode, branch="auto"):
         except Exception:
             pass
 
-    cp_cc = bundle.get("cp_classcond")
-    if cp_cc is not None:
-        in_set = DF.conformal_set(risk, cp_cc)
-    else:
-        cp_overall = bundle.get("cp_overall", {})
-        q_hat = cp_overall.get("q_hat", 0.8)
-        in_set = []
-        if (1 - risk) >= 1 - q_hat:
-            in_set.append("benign")
-        if risk >= 1 - q_hat:
-            in_set.append("malignant")
-    if not in_set:
-        in_set = ["benign", "malignant"]
-
     input_unreliable = (novelty_score is not None and novelty_score > NOVELTY_UNRELIABLE)
-    sens_thr = bundle.get("sensitivity_threshold_90")
-    if input_unreliable:
-        tier = "MEDIUM"
-    elif in_set == ["malignant"]:
-        tier = "HIGH"
-    elif in_set == ["benign"]:
-        tier = "LOW"
-    elif sens_thr is not None and risk >= sens_thr:
-        tier = "HIGH"
+
+    # v2 -- FIX: tier logic now branches on which model actually produced
+    # `risk`, matching the app's real (v10.3-fixed) logic. Previously this
+    # always compared `risk` against the MAIN model's threshold (~6.6%)
+    # even for specialist-scored rows, where a compressed score like 1-2%
+    # would almost NEVER cross that bar -- silently making every specialist
+    # row look falsely reassuring in past batch runs. The specialist branch
+    # never returns LOW (matches the app) and uses only its own Youden's J
+    # operating point, not a 3-way OR of lenient thresholds (see
+    # streamlit_app.py's v10.3 comment for why that OR was removed).
+    sens_thr = None
+    conformal_set_str = None
+    if model_used == "specialist":
+        op_thr_j = (specialist_bundle or {}).get("operating_threshold_youden")
+        tier = "HIGH" if (op_thr_j is not None and risk >= op_thr_j) else "MEDIUM"
     else:
-        tier = "MEDIUM"
+        cp_cc = bundle.get("cp_classcond")
+        if cp_cc is not None:
+            in_set = DF.conformal_set(risk, cp_cc)
+        else:
+            cp_overall = bundle.get("cp_overall", {})
+            q_hat = cp_overall.get("q_hat", 0.8)
+            in_set = []
+            if (1 - risk) >= 1 - q_hat:
+                in_set.append("benign")
+            if risk >= 1 - q_hat:
+                in_set.append("malignant")
+        if not in_set:
+            in_set = ["benign", "malignant"]
+        conformal_set_str = "+".join(in_set)
+
+        sens_thr = bundle.get("sensitivity_threshold_90")
+        if input_unreliable:
+            tier = "MEDIUM"
+        elif in_set == ["malignant"]:
+            tier = "HIGH"
+        elif in_set == ["benign"]:
+            tier = "LOW"
+        elif sens_thr is not None and risk >= sens_thr:
+            tier = "HIGH"
+        else:
+            tier = "MEDIUM"
 
     return {
         "predicted_prob": risk,
         "tier": tier,
         "model_used": model_used,
         "p_clinical": p_clinical,
-        "conformal_set": "+".join(in_set),
+        "conformal_set": conformal_set_str,
         "novelty_score": novelty_score,
         "sensitivity_threshold_90": sens_thr,
     }
