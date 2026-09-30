@@ -265,15 +265,16 @@ def run_one(image, bundle, bb, vis_dim, nlp_dim, feature_mode, branch="auto"):
     # always compared `risk` against the MAIN model's threshold (~6.6%)
     # even for specialist-scored rows, where a compressed score like 1-2%
     # would almost NEVER cross that bar -- silently making every specialist
-    # row look falsely reassuring in past batch runs. The specialist branch
-    # never returns LOW (matches the app) and uses only its own Youden's J
-    # operating point, not a 3-way OR of lenient thresholds (see
-    # streamlit_app.py's v10.3 comment for why that OR was removed).
+    # row look falsely reassuring in past batch runs. v2 update (matches app
+    # v10.4): the specialist branch is now capped at MEDIUM always, never
+    # HIGH -- even a lesion-free skin test image scored above the Youden's J
+    # threshold in the live app, which is direct evidence that no single
+    # threshold on this near-chance model's raw score is a trustworthy
+    # HIGH/not-HIGH verdict.
     sens_thr = None
     conformal_set_str = None
     if model_used == "specialist":
-        op_thr_j = (specialist_bundle or {}).get("operating_threshold_youden")
-        tier = "HIGH" if (op_thr_j is not None and risk >= op_thr_j) else "MEDIUM"
+        tier = "MEDIUM"
     else:
         cp_cc = bundle.get("cp_classcond")
         if cp_cc is not None:
