@@ -506,7 +506,8 @@ def detect_ruler_bumps_and_diameter(cv_img_bgr, lesion_radius_px_guess=None):
 
 
 def render_risk_gauge(risk, color, height=240, label="MALIGNANCY RISK",
-                       tier="MEDIUM", confidence_pct=None, confidence_label="Score"):
+                       tier="MEDIUM", confidence_pct=None, confidence_label="Score",
+                       show_confidence=True):
     import math
 
     r = 80
@@ -547,11 +548,13 @@ def render_risk_gauge(risk, color, height=240, label="MALIGNANCY RISK",
 
     if confidence_pct is None:
         confidence_pct = risk * 100
-    conf_svg = (
-        f'<text x="{cx}" y="{cy + 32}" font-family="JetBrains Mono, monospace" '
-        f'font-size="11" text-anchor="middle" fill="#a8adb8">'
-        f'{confidence_label}: {confidence_pct:.1f}%</text>'
-    )
+    conf_svg = ""
+    if show_confidence:
+        conf_svg = (
+            f'<text x="{cx}" y="{cy + 32}" font-family="JetBrains Mono, monospace" '
+            f'font-size="11" text-anchor="middle" fill="#a8adb8">'
+            f'{confidence_label}: {confidence_pct:.1f}%</text>'
+        )
 
     html = f"""
     <div style="display:flex;justify-content:center;">
@@ -1023,24 +1026,21 @@ if source_bytes is not None and run:
             # (high novelty), or specialist-routed (weak signal, never
             # shown as LOW) -> MEDIUM.
             if use_specialist:
-                sens_thr = specialist_bundle.get("sensitivity_threshold_90")
-                op_thr_j = specialist_bundle.get("operating_threshold_youden")
-                # v10.3 -- FIX: this used to OR three thresholds together,
-                # including sens_thr (~0.22%, tuned for 90% sensitivity on a
-                # ~1.5%-positive-rate training set -- deliberately so low that
-                # almost ANY nonzero signal crosses it) and percentile_rank>=66
-                # (top third of a heavily right-compressed distribution, also
-                # easy to cross). Combined, that meant a single weak signal
-                # from any one of three lenient criteria was enough for HIGH,
-                # which is why nearly every MED-NODE naevus (benign) photo was
-                # landing on HIGH once routed to the specialist. Using ONLY
-                # the Youden's J operating point -- the model's own
-                # sensitivity/specificity-BALANCED threshold, ~82.5%
-                # specificity per the notebook's own DDI evaluation -- is a
-                # deliberately stricter bar for "the specialist itself thinks
-                # this is concerning," not just "not exactly zero."
-                _hi = (op_thr_j is not None and risk >= op_thr_j)
-                tier3 = "HIGH" if _hi else "MEDIUM"  # never LOW -- see note above
+                # v10.4 -- FIX: v10.3 tightened this to ONLY the Youden's J
+                # threshold, but a test image of plain, lesion-free skin
+                # still scored above it and rendered as HIGH. That's not a
+                # threshold-placement problem anymore -- it's direct evidence
+                # that this specialist's discrimination (DDI AUC 0.53, i.e.
+                # near chance) is too weak for ANY single threshold on its
+                # raw score to be trustworthy as a HIGH/not-HIGH verdict, on
+                # a blank patch of skin as much as on a real lesion. Given
+                # that, asserting HIGH from this branch at all overclaims
+                # what a near-chance model can honestly support. The
+                # specialist branch is capped at MEDIUM ("recapture with the
+                # dermatoscope for a validated score") and never asserts
+                # HIGH or LOW -- it becomes a routing nudge, not a risk
+                # verdict, until the specialist itself is retrained/replaced.
+                tier3 = "MEDIUM"
             else:
                 sens_thr = bundle.get("sensitivity_threshold_90")
                 if input_unreliable:
@@ -1061,33 +1061,40 @@ if source_bytes is not None and run:
                 confidence_pct=(percentile_rank if use_specialist and percentile_rank is not None
                                  else risk * 100),
                 confidence_label=("Percentile" if use_specialist else "Score"),
+                show_confidence=not use_specialist,
             )
-            if use_specialist and percentile_rank is not None:
-                # v9.4: this model's raw score is severely compressed by class
-                # imbalance (~98.5% negative in training) -- a genuine positive
-                # rarely tops 50%, so the raw percentage alone reads as "low"
-                # when it may be the most suspicious score this model has ever
-                # produced. Surface the percentile right next to the number
-                # itself, not three paragraphs into the caption below it.
-                st.markdown(
-                    f'<div style="text-align:center;color:{AMBER};font-weight:600;">'
-                    f'Higher than {percentile_rank:.1f}% of this model\'s calibration images '
-                    f'(read this, not the raw %)</div>',
-                    unsafe_allow_html=True,
-                )
             st.caption(risk_caption)
 
+            # v10.4 -- also addresses: showing a raw percentage next to the
+            # specialist branch's tier has repeatedly read as contradictory
+            # (e.g. "1.5% / HIGH") even when the tier itself was correct,
+            # because the specialist's raw score is compressed and not
+            # meaningful as a percentage to a lay reader. The main model's
+            # percentage stays -- it has real referral-threshold semantics
+            # (see the caption below) -- but the specialist branch no longer
+            # displays one at all.
+            _model_output_line = (
+                "" if use_specialist else
+                f"""<div style="text-align:center;color:{MUTED};font-size:0.85rem;margin-bottom:1rem;">
+                    model output: {risk:.1%}</div>"""
+            )
             st.markdown(
                 f"""<div style="text-align:center;margin:0.6rem 0 0.2rem 0;">
                     <span class="ds-pill" style="background:{tier3_color}22;
                         color:{tier3_color};font-size:1.05rem;padding:0.5rem 1.4rem;">
                     ● {TIER_LABEL[tier3]}</span></div>
-                <div style="text-align:center;color:{MUTED};font-size:0.85rem;margin-bottom:1rem;">
-                    model output: {risk:.1%}</div>""",
+                {_model_output_line}""",
                 unsafe_allow_html=True,
             )
-            if sens_thr is not None:
-                _oof_thr = use_specialist or bundle.get("threshold_source") == "oof"
+            if use_specialist:
+                st.caption(
+                    "This branch's raw score isn't shown as a percentage -- its "
+                    "discrimination is too weak (near-chance on some external "
+                    "cohorts) for a number to be meaningful. Recapture with the "
+                    "dermatoscope attachment for a validated numeric risk score."
+                )
+            elif sens_thr is not None:
+                _oof_thr = bundle.get("threshold_source") == "oof"
                 st.caption(
                     f"Referral threshold: risk ≥ {sens_thr:.1%}, chosen to flag ~90% of "
                     f"melanomas in "
