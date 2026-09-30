@@ -1026,21 +1026,31 @@ if source_bytes is not None and run:
             # (high novelty), or specialist-routed (weak signal, never
             # shown as LOW) -> MEDIUM.
             if use_specialist:
-                # v10.4 -- FIX: v10.3 tightened this to ONLY the Youden's J
-                # threshold, but a test image of plain, lesion-free skin
-                # still scored above it and rendered as HIGH. That's not a
-                # threshold-placement problem anymore -- it's direct evidence
-                # that this specialist's discrimination (DDI AUC 0.53, i.e.
-                # near chance) is too weak for ANY single threshold on its
-                # raw score to be trustworthy as a HIGH/not-HIGH verdict, on
-                # a blank patch of skin as much as on a real lesion. Given
-                # that, asserting HIGH from this branch at all overclaims
-                # what a near-chance model can honestly support. The
-                # specialist branch is capped at MEDIUM ("recapture with the
-                # dermatoscope for a validated score") and never asserts
-                # HIGH or LOW -- it becomes a routing nudge, not a risk
-                # verdict, until the specialist itself is retrained/replaced.
-                tier3 = "MEDIUM"
+                # v10.5 -- v10.4 capped this branch at MEDIUM always, after a
+                # lesion-free skin test image scored above Youden's J and
+                # rendered as HIGH. HIGH stays capped out for the same
+                # reason (no single high cut on a near-chance model -- DDI
+                # AUC 0.53 -- is trustworthy as a HIGH verdict). But an
+                # always-MEDIUM branch gives zero reassurance even on
+                # obviously benign input, which isn't the right tradeoff
+                # either. Restored a real LOW, using the model's OWN most
+                # permissive threshold as the cut: sens_thr is tuned to
+                # catch 90% of true positives, so scoring BELOW it means
+                # this image sits in the ~10% risk band the model itself
+                # would exclude even at its most sensitive setting -- a
+                # meaningfully safer claim than "not exactly zero," though
+                # still weaker evidence than the main model's LOW (that one
+                # has a real class-conditional conformal calibration behind
+                # it; this specialist does not -- see PATCH_NOTES/next-steps
+                # for adding one once UMich data lets this get retrained).
+                # Also requires the input not already be flagged unreliable
+                # (high novelty) -- an out-of-distribution image should
+                # never read as reassuring just because its score is low.
+                sens_thr = specialist_bundle.get("sensitivity_threshold_90")
+                _confident_low = (
+                    sens_thr is not None and risk < sens_thr and not input_unreliable
+                )
+                tier3 = "LOW" if _confident_low else "MEDIUM"
             else:
                 sens_thr = bundle.get("sensitivity_threshold_90")
                 if input_unreliable:
