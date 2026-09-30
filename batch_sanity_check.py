@@ -265,17 +265,21 @@ def run_one(image, bundle, bb, vis_dim, nlp_dim, feature_mode, branch="auto"):
     # always compared `risk` against the MAIN model's threshold (~6.6%)
     # even for specialist-scored rows, where a compressed score like 1-2%
     # would almost NEVER cross that bar -- silently making every specialist
-    # row look falsely reassuring in past batch runs. v2 update (matches app
-    # v10.4): the specialist branch is now capped at MEDIUM always, never
-    # HIGH -- even a lesion-free skin test image scored above the Youden's J
-    # threshold in the live app, which is direct evidence that no single
-    # threshold on this near-chance model's raw score is a trustworthy
-    # HIGH/not-HIGH verdict.
-    sens_thr = None
+    # row look falsely reassuring in past batch runs. v3 update (matches app
+    # v10.5): HIGH stays fully capped out for the specialist branch (no
+    # single high cut on a near-chance model -- DDI AUC 0.53 -- is
+    # trustworthy). LOW is restored using the model's own most permissive
+    # threshold (sensitivity_threshold_90, tuned for 90% sensitivity): a
+    # score below it sits in the ~10% risk band the model would exclude
+    # even at its most sensitive setting, and only counts if the input
+    # isn't already flagged unreliable (high novelty).
     conformal_set_str = None
     if model_used == "specialist":
-        tier = "MEDIUM"
+        sens_thr = (specialist_bundle or {}).get("sensitivity_threshold_90")
+        confident_low = (sens_thr is not None and risk < sens_thr and not input_unreliable)
+        tier = "LOW" if confident_low else "MEDIUM"
     else:
+        sens_thr = None
         cp_cc = bundle.get("cp_classcond")
         if cp_cc is not None:
             in_set = DF.conformal_set(risk, cp_cc)
