@@ -116,7 +116,7 @@ class ReferralNote:
     days_since_prior_capture: Optional[int] = None
 
     device_id: str = "DermScript-v1"
-    software_version: str = "v9.0"
+    software_version: str = "v11.0"
 
     def recommended_action(self) -> str:
         """Plain-language line for the top of the note — this is the one
@@ -125,10 +125,10 @@ class ReferralNote:
         DRAPS uncertainty, modality mismatch, and novelty together), then
         falls back to the risk-tier-only logic if that score isn't set."""
         if self.confidence_tier == "REFER":
-            return ("REFER FOR IN-PERSON DERMATOLOGIST EVALUATION — multiple "
-                     "independent uncertainty signals triggered (see Triage "
-                     "Confidence above). Do not rely on the risk score alone "
-                     "for this capture.")
+            return ("REFER FOR IN-PERSON DERMATOLOGIST EVALUATION — this capture is "
+                     "outside what the model was validated on (for example a "
+                     "clinical-camera photo) or is unusual. Do not rely on the "
+                     "risk score alone for this capture.")
         if self.confidence_tier == "VERIFY" and self.recapture_hint:
             return (f"VERIFY BEFORE TRUSTING THIS RESULT — {self.recapture_hint} "
                      f"If recapture isn't possible, treat this risk score with "
@@ -170,7 +170,7 @@ class ReferralNote:
         lines.append("")
         lines.append("MODEL OUTPUT")
         lines.append("-" * 62)
-        lines.append(f"  Risk score: {self.risk_score:.1%}  (tier: {self.risk_tier})")
+        lines.append(f"  Model score: {self.risk_score:.2f} (a ranking score, not a probability)  (tier: {self.risk_tier})")
         if self.draps_conformal_set is not None:
             lines.append(f"  DRAPS conformal set: {{{', '.join(self.draps_conformal_set)}}}"
                          f"  (q_hat={self.draps_q_hat:.3f})" if self.draps_q_hat is not None else "")
@@ -254,7 +254,7 @@ class ReferralNote:
           <div style="background:#0a0b0e;border-left:3px solid {tier_color};border-radius:6px;
                       padding:0.7rem 1rem;margin-bottom:0.8rem;">
             <div style="font-family:'JetBrains Mono',monospace;font-size:1.6rem;font-weight:700;color:{tier_color};">
-              {self.risk_score:.1%} <span style="font-size:0.9rem;">({self.risk_tier})</span>
+              {self.risk_score:.2f} <span style="font-size:0.9rem;">({self.risk_tier})</span>
             </div>
             {"<div style='color:#e8a33d;'>DRAPS: model uncertain at 95% coverage — both outcomes plausible</div>" if self.model_uncertain else ""}
             {modality_html}
